@@ -425,7 +425,14 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     }
 
     def on_event(note: dict) -> None:
-        handler = handlers.get(note.get("method") or "") if isinstance(note, dict) else None
+        method = note.get("method") or "" if isinstance(note, dict) else ""
+        if method:
+            # Any codex notification is proof the turn is alive. The display handlers below never touched the
+            # activity clock, so a long tool-only turn looked idle and the liveness watchdog force-interrupted it
+            # while codex was still working.
+            _call_guarded(getattr(agent, "_touch_activity", None), "_touch_activity raised on codex event %s",
+                          method, args=(f"codex event: {method}",))
+        handler = handlers.get(method)
         if handler is not None:
             params = note.get("params")
             handler(params if isinstance(params, dict) else {})

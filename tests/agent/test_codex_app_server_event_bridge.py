@@ -308,6 +308,54 @@ class TestBridgeRobustness:
         }))
 
 
+class TestLivenessTouch:
+    """Every codex notification is proof the turn is alive and must feed the liveness clock.
+
+    Without this, a long tool-only turn never advanced the activity clock and the
+    gateway watchdog force-interrupted it while codex was still working.
+    """
+
+    def test_every_notification_touches_activity(self):
+        agent = _make_stub_agent()
+        agent._touch_activity = MagicMock(name="_touch_activity")
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started({
+            "type": "commandExecution", "id": "exec-1", "command": "ls",
+        }))
+        bridge({"method": "item/agentMessage/delta", "params": {"delta": "x"}})
+        # A method the bridge has no display handler for still proves liveness.
+        bridge({"method": "thread/tokenUsage/updated", "params": {}})
+        assert agent._touch_activity.call_count == 3
+        described = [c.args[0] for c in agent._touch_activity.call_args_list]
+        assert described == [
+            "codex event: item/started",
+            "codex event: item/agentMessage/delta",
+            "codex event: thread/tokenUsage/updated",
+        ]
+
+    def test_notification_without_method_does_not_touch(self):
+        agent = _make_stub_agent()
+        agent._touch_activity = MagicMock(name="_touch_activity")
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge({})
+        bridge({"params": {"delta": "x"}})
+        bridge("not a dict")
+        agent._touch_activity.assert_not_called()
+
+    def test_touch_exceptions_do_not_propagate(self):
+        agent = _make_stub_agent()
+        agent._touch_activity = MagicMock(side_effect=RuntimeError("boom"))
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge({"method": "item/agentMessage/delta", "params": {"delta": "x"}})
+        # The display handler still ran after the touch failed.
+        agent._fire_stream_delta.assert_called_once_with("x")
+
+    def test_agent_without_touch_activity_is_fine(self):
+        agent = _make_stub_agent()
+        assert not hasattr(agent, "_touch_activity")
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge({"method": "item/agentMessage/delta", "params": {"delta": "x"}})
+        agent._fire_stream_delta.assert_called_once_with("x")
 
 
 # ---------- end-to-end: bridge is wired in run_codex_app_server_turn ----------
