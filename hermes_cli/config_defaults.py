@@ -1654,6 +1654,12 @@ DEFAULT_CONFIG = {
         "cron_mode": "deny",
         "single_query_mode": "deny",
         "unattended_mode": "deny",
+        # Codex app-server can ask for broader filesystem/network permissions or relay an MCP
+        # elicitation. "ask" routes supported requests through Hermes' approval surface when one
+        # exists; sessions without a human-capable approval surface, structured forms, and URL flows
+        # still fail closed.
+        # "decline" never presents these request families to the user.
+        "codex_server_requests": "ask",
         # Extra rules appended to the smart-approval guardian's SYSTEM prompt, e.g. "Always ESCALATE
         # commands touching /etc".
         "smart_policy": "",
