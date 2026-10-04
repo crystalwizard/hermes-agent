@@ -247,3 +247,37 @@ class TestRequestToolApproval:
         )
         res = request_tool_approval("computer_use", "click", rule_key="cua")
         assert res == {"approved": True, "message": None}
+
+    @pytest.mark.parametrize("bypass", ["yolo", "off"])
+    def test_required_human_consent_ignores_global_bypass(self, monkeypatch, bypass):
+        """A caller representing a distinct consent protocol can require a real
+        answer even when legacy command/tool approvals are globally bypassed."""
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(tools_approval_context, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(
+            approval, "is_current_session_yolo_enabled", lambda: bypass == "yolo"
+        )
+        monkeypatch.setattr(
+            approval_context, "_get_approval_mode", lambda: "off" if bypass == "off" else "manual"
+        )
+        prompted = []
+        monkeypatch.setattr(
+            approval, "prompt_dangerous_approval",
+            lambda *a, **k: prompted.append((a, k)) or "deny",
+        )
+        monkeypatch.setattr(
+            approval_prompt, "prompt_dangerous_approval",
+            lambda *a, **k: prompted.append((a, k)) or "deny",
+        )
+
+        res = request_tool_approval(
+            "codex_permissions",
+            "Codex requests network access",
+            rule_key="codex-permission-profile",
+            allow_global_bypass=False,
+        )
+
+        assert prompted
+        assert res["approved"] is False
+        assert res["outcome"] == "denied"

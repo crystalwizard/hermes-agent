@@ -518,6 +518,7 @@ def _ensure_codex_session(agent, messages: List[Dict[str, Any]] | None = None) -
     from agent.transports.codex_app_server_session import CodexAppServerSession, _ServerRequestRouting
     from hermes_cli.codex_runtime_switch import get_configured_codex_binary
     from hermes_cli.config import load_config
+    config = load_config()
     # Approval callback: Hermes' standard prompt flow when a CLI thread installed one.
     approval_callback = None
     with suppress(Exception):
@@ -531,6 +532,17 @@ def _ensure_codex_session(agent, messages: List[Dict[str, Any]] | None = None) -
         auto_approve_requests = is_approval_bypass_active()
     except Exception:
         logger.debug("codex app-server: approval-bypass lookup failed; keeping fail-closed default", exc_info=True)
+    codex_server_request_policy = str(
+        (config.get("approvals") or {}).get("codex_server_requests", "ask")
+    ).strip().lower()
+    if codex_server_request_policy not in {"ask", "decline"}:
+        logger.warning(
+            "Invalid approvals.codex_server_requests value %r; declining Codex server requests",
+            codex_server_request_policy,
+        )
+        ask_server_requests = False
+    else:
+        ask_server_requests = codex_server_request_policy == "ask"
     # Bridge codex JSON-RPC notifications (item/started, item/completed, item/agentMessage/delta, ...) into
     # Hermes' gateway UI callbacks (tool_progress_callback, _fire_stream_delta,
     # _emit_interim_assistant_message). Without this, Discord/Telegram users see no live tool-progress or
@@ -554,8 +566,12 @@ def _ensure_codex_session(agent, messages: List[Dict[str, Any]] | None = None) -
         model_provider = codex_model_provider_id(str(getattr(agent, "requested_provider", "") or ""))
     agent._codex_session = CodexAppServerSession(
         cwd=getattr(agent, "session_cwd", None) or str(resolve_agent_cwd()), approval_callback=approval_callback,
-        codex_bin=get_configured_codex_binary(load_config()),
-        request_routing=_ServerRequestRouting(auto_approve_exec=auto_approve_requests, auto_approve_apply_patch=auto_approve_requests),
+        codex_bin=get_configured_codex_binary(config),
+        request_routing=_ServerRequestRouting(
+            auto_approve_exec=auto_approve_requests,
+            auto_approve_apply_patch=auto_approve_requests,
+            ask_server_requests=ask_server_requests,
+        ),
         on_event=make_codex_app_server_event_bridge(agent),
         developer_instructions=developer_instructions or None,
         model=getattr(agent, "model", None) if model_provider else None, model_provider=model_provider,
