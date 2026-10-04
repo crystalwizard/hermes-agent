@@ -174,6 +174,7 @@ import {
 import type { RosterProfileMetadata } from './connection-registry'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken, resolveServedDashboardToken } from './dashboard-token'
+import { shouldRegisterDeepLinkProtocol } from './deep-link-registration'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import { formatDesktopLogLine } from './desktop-log-line'
 import {
@@ -18632,6 +18633,14 @@ ipcMain.handle('hermes:deep-link-ready', () => {
 })
 
 function registerDeepLinkProtocol() {
+  if (!shouldRegisterDeepLinkProtocol(process.env)) {
+    // A second, separately owned install on this Windows user must not take the
+    // hermes:// handler from the other one.
+    rememberLog(`[deeplink] skipped registering ${HERMES_PROTOCOL}:// handler (HERMES_DESKTOP_SKIP_PROTOCOL_REGISTRATION=1)`)
+
+    return
+  }
+
   try {
     if (process.defaultApp && process.argv.length >= 2) {
       // Dev: register with the electron exec path + entry script so the OS can
