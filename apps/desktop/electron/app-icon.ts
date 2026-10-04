@@ -70,13 +70,15 @@ export function resolveAppIcon(
  */
 export function appIconCandidates(opts: {
   isWindows: boolean
+  overridePath?: string
   appRoot: string
   resourcesPath?: string
   unpackedPathFor: (p: string) => string
 }): string[] {
-  const { isWindows, appRoot, resourcesPath, unpackedPathFor } = opts
+  const { isWindows, overridePath, appRoot, resourcesPath, unpackedPathFor } = opts
 
   return [
+    ...(overridePath ? [overridePath] : []),
     ...(isWindows ? [path.join(resourcesPath ?? '', 'icon.ico'), path.join(appRoot, 'assets', 'icon.ico')] : []),
     path.join(appRoot, 'public', 'apple-touch-icon.png'),
     path.join(appRoot, 'dist', 'apple-touch-icon.png'),
