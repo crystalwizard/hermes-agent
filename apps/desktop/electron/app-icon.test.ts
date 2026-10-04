@@ -81,3 +81,33 @@ test('appIconCandidates keeps the documented precedence ladder', () => {
     'resources/ icon.ico is the highest-precedence Windows rung'
   )
 })
+
+test('appIconCandidates prepends an instance override without changing the fallback ladder', () => {
+  const options = {
+    isWindows: true,
+    appRoot: 'C:\\app',
+    resourcesPath: 'C:\\resources',
+    unpackedPathFor: (p: string) => `${p}\\unpacked`
+  }
+  const fallback = appIconCandidates(options)
+  const overridePath = 'F:\\Ari\\Ari.ico'
+  const candidates = appIconCandidates({ ...options, overridePath })
+
+  assert.deepEqual(candidates, [overridePath, ...fallback])
+})
+
+test('resolveAppIcon falls through when an instance override does not decode', () => {
+  const overridePath = 'F:\\Ari\\bad.ico'
+  const fallbackPath = path.join('C:\\resources', 'icon.ico')
+  const candidates = appIconCandidates({
+    isWindows: true,
+    overridePath,
+    appRoot: 'C:\\app',
+    resourcesPath: 'C:\\resources',
+    unpackedPathFor: (p: string) => `${p}\\unpacked`
+  })
+
+  const picked = resolveAppIcon(candidates, candidate => candidate === fallbackPath)
+
+  assert.equal(picked, fallbackPath)
+})

@@ -505,6 +505,7 @@ import {
   MIN_HEIGHT as WINDOW_MIN_HEIGHT,
   MIN_WIDTH as WINDOW_MIN_WIDTH
 } from './window-state'
+import { applyWindowsAppIdentity } from './windows-app-identity'
 import { hiddenWindowsChildOptions } from './windows-child-options'
 import {
   buildPathExtCandidates,
@@ -1029,6 +1030,8 @@ const BOOT_FAKE_STEP_MS = (() => {
 })()
 
 const APP_NAME = process.env.HERMES_DESKTOP_APP_NAME || 'Hermes'
+const APP_ID = process.env.HERMES_DESKTOP_APP_ID || 'com.nousresearch.hermes'
+const APP_ICON_OVERRIDE = process.env.HERMES_DESKTOP_ICON_PATH || undefined
 const HUD_WINDOW_TITLE = `${APP_NAME} HUD`
 const TITLEBAR_HEIGHT = 34
 const MACOS_TRAFFIC_LIGHTS_HEIGHT = 14
@@ -1051,6 +1054,7 @@ const WINDOW_BUTTON_POSITION = {
 // resolveAppIcon (decoding probe): existence alone is not proof the bytes
 // decode, and an undecodable icon must never take the main process down.
 const APP_ICON_PATHS = appIconCandidates({
+  overridePath: APP_ICON_OVERRIDE,
   isWindows: IS_WINDOWS,
   appRoot: APP_ROOT,
   resourcesPath: process.resourcesPath,
@@ -1438,7 +1442,7 @@ Menu.setApplicationMenu(null)
 // need this, so gate it on Windows. (Fixes: desktop approval/turn notifications
 // never firing on Windows.)
 if (IS_WINDOWS) {
-  app.setAppUserModelId('com.nousresearch.hermes')
+  app.setAppUserModelId(APP_ID)
 }
 
 // Seed the native About panel with the live Hermes version. This is refreshed
@@ -13941,7 +13945,7 @@ function spawnSecondaryWindow({
     height: SESSION_WINDOW_MIN_HEIGHT,
     minWidth: SESSION_WINDOW_MIN_WIDTH,
     minHeight: SESSION_WINDOW_MIN_HEIGHT,
-    title: 'Hermes',
+    title: APP_NAME,
     titleBarStyle: 'hidden',
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
@@ -13956,6 +13960,8 @@ function spawnSecondaryWindow({
     show: false,
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
+
+  applyWindowsAppIdentity(win, { isWindows: IS_WINDOWS, appId: APP_ID, iconPath: icon })
 
   // Chat-surface registration: applyWindowTranslucency swaps this window's
   // backing between opaque-themed and alpha-0 when glass toggles.
@@ -14035,7 +14041,7 @@ function spawnBrowserWindow(tabId) {
     height: BROWSER_WINDOW_HEIGHT,
     minWidth: BROWSER_WINDOW_MIN_WIDTH,
     minHeight: BROWSER_WINDOW_MIN_HEIGHT,
-    title: 'Hermes',
+    title: APP_NAME,
     titleBarStyle: 'hidden',
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
@@ -14044,6 +14050,8 @@ function spawnBrowserWindow(tabId) {
     show: false,
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
+
+  applyWindowsAppIdentity(win, { isWindows: IS_WINDOWS, appId: APP_ID, iconPath: icon })
 
   translucencyBackedWindows.add(win)
 
@@ -14136,7 +14144,7 @@ function createInstanceWindow(
     ...nextInstanceBounds(source),
     minWidth: WINDOW_MIN_WIDTH,
     minHeight: WINDOW_MIN_HEIGHT,
-    title: 'Hermes',
+    title: APP_NAME,
     titleBarStyle: 'hidden',
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
@@ -14145,6 +14153,8 @@ function createInstanceWindow(
     show: false,
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
+
+  applyWindowsAppIdentity(win, { isWindows: IS_WINDOWS, appId: APP_ID, iconPath: icon })
 
   instanceWindows.add(win)
   minimizeToTray.registerWindow(win)
@@ -15120,7 +15130,7 @@ function createWindow() {
     ...computeWindowOptions(savedWindowState, screen.getAllDisplays()),
     minWidth: WINDOW_MIN_WIDTH,
     minHeight: WINDOW_MIN_HEIGHT,
-    title: 'Hermes',
+    title: APP_NAME,
     // Frameless title bar on every platform so the renderer can paint the
     // "hide sidebar" button (and other left-side titlebar tools) flush with
     // the top edge — matching the macOS layout where the traffic lights sit
@@ -15143,6 +15153,8 @@ function createWindow() {
     // session-windows.ts and stream-throttle.ts.
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
+
+  applyWindowsAppIdentity(mainWindow, { isWindows: IS_WINDOWS, appId: APP_ID, iconPath: icon })
 
   const createdMainWindow = mainWindow
   minimizeToTray.registerWindow(createdMainWindow, { closeToTray: true })
