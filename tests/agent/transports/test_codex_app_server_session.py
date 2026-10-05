@@ -1283,6 +1283,30 @@ class TestCodexServerRequestApprovals:
             "action": "decline", "content": None, "_meta": None,
         })]
 
+    def test_hermes_tools_special_case_is_form_mode_only(self):
+        """The internal-server accept covers FORM requests only: URL mode is declined like for any server, and an
+        unknown mode is an invalid request, never an accept."""
+        from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
+
+        def must_not_prompt(*_a, **_kw):
+            raise AssertionError("hermes-tools must not reach the human gate in URL mode")
+
+        url_mode = self._run_request(
+            "mcpServer/elicitation/request",
+            params={"serverName": HERMES_TOOLS_MCP_SERVER_NAME, "mode": "url",
+                    "url": "https://example.invalid/consent", "message": "m"},
+            callback=must_not_prompt,
+        )
+        assert url_mode.responses == [("approval-1", {"action": "decline", "content": None, "_meta": None})]
+
+        unknown = self._run_request(
+            "mcpServer/elicitation/request",
+            params={"serverName": HERMES_TOOLS_MCP_SERVER_NAME, "mode": "telepathy", "message": "m"},
+            callback=must_not_prompt,
+        )
+        assert unknown.responses == []
+        assert unknown.error_responses[0][1] == -32602
+
     def test_lookalike_server_name_does_not_get_the_internal_special_case(self):
         from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
 
