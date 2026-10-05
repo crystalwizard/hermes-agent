@@ -135,6 +135,48 @@ class TestRequestToolApproval:
         assert res["approved"] is True
 
 
+    @pytest.mark.parametrize("context", ["cron", "single_query", "unattended"])
+    def test_require_human_is_not_granted_by_an_approve_mode_without_a_human(self, monkeypatch, context):
+        """cron/single-query/unattended *approve* modes are the operator's choice for ordinary tool calls, but
+        a distinct consent protocol (e.g. a Codex permission profile) that asks for a human must never be
+        granted by them when nobody is present."""
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(tools_approval_context, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(approval, "_is_cron_approval_context", lambda: context == "cron")
+        monkeypatch.setattr(tools_approval_context, "_is_cron_approval_context", lambda: context == "cron")
+        monkeypatch.setattr(approval, "_is_single_query_approval_context", lambda: context == "single_query")
+        monkeypatch.setattr(approval_context, "_get_cron_approval_mode", lambda: "approve")
+        monkeypatch.setattr(approval_context, "_get_single_query_approval_mode", lambda: "approve")
+        monkeypatch.setattr(approval_context, "_get_unattended_approval_mode", lambda: "approve")
+        if context == "unattended":
+            monkeypatch.setenv("HERMES_SESSION_PLATFORM", "api_server")
+        # Control: the same context grants an ordinary call without a human.
+        assert request_tool_approval("terminal", "smtp send")["approved"] is True
+        # require_human: the same context must fail closed.
+        res = request_tool_approval(
+            "codex_permissions", "Codex requests network access",
+            rule_key="codex-permission-profile", allow_global_bypass=False, require_human=True,
+        )
+        assert res["approved"] is False
+        assert "human" in res["message"].lower() or "approve" in res["message"].lower()
+
+    def test_require_human_still_asks_an_interactive_user(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(tools_approval_context, "_is_gateway_approval_context", lambda: False)
+        prompted = []
+        for target in (approval, approval_prompt):
+            monkeypatch.setattr(
+                target, "prompt_dangerous_approval",
+                lambda *a, **k: prompted.append(True) or "once",
+            )
+        res = request_tool_approval(
+            "codex_permissions", "Codex requests network access",
+            rule_key="codex-permission-profile", allow_global_bypass=False, require_human=True,
+        )
+        assert prompted and res["approved"] is True
+
     def test_distinct_reasons_get_distinct_keys(self, monkeypatch):
         """Two different reasons on the SAME tool must not share an [a]lways
         allowlist entry (Finding 3: tool_name alone was too coarse)."""

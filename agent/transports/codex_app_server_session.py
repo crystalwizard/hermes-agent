@@ -25,6 +25,7 @@ from agent.transports.codex_app_server import (
     CodexAppServerClient, CodexAppServerError, CodexAppServerTransportError,
 )
 from agent.transports.codex_event_projector import CodexEventProjector, ProjectionResult
+from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -704,7 +705,7 @@ class CodexAppServerSession:
             if not isinstance(params, dict):
                 client.respond_error(rid, code=-32602, message="Server request params must be an object")
                 return
-            if params.get("threadId") != self._thread_id:
+            if not self._thread_id or params.get("threadId") != self._thread_id:
                 client.respond_error(
                     rid, code=-32602,
                     message="Server request does not belong to the active thread",
@@ -712,7 +713,7 @@ class CodexAppServerSession:
                 return
             request_turn_id = params.get("turnId")
             turn_id_required = method == "item/permissions/requestApproval"
-            if ((turn_id_required and request_turn_id != self._active_turn_id)
+            if ((turn_id_required and (not self._active_turn_id or request_turn_id != self._active_turn_id))
                     or (request_turn_id is not None and request_turn_id != self._active_turn_id)):
                 client.respond_error(
                     rid, code=-32602,
@@ -730,7 +731,14 @@ class CodexAppServerSession:
         """Route MCP consent through the same human approval surface as native Hermes MCP."""
         server_name = params.get("serverName") or "<unknown>"
         if not self._routing.ask_server_requests:
+            # approvals.codex_server_requests: decline is a hard off, including for Hermes' own server.
             return {"action": "decline", "content": None, "_meta": None}
+        if server_name == HERMES_TOOLS_MCP_SERVER_NAME:
+            # Hermes' own managed tools server (exact name, thread/turn already verified above): opted in by
+            # enabling the runtime and exposes nothing codex's shell cannot do. It never elicits user input, so
+            # the fields in its traffic are tool-argument schema, not a form for a human to fill in. Keep the
+            # long-standing auto-accept; every OTHER server goes through the human gate below.
+            return {"action": "accept", "content": None, "_meta": None}
         mode = params.get("mode") or "form"
         if mode not in {"form", "url"}:
             raise _InvalidServerRequestParams(f"Unsupported MCP elicitation mode: {mode}")
@@ -763,7 +771,7 @@ class CodexAppServerSession:
 
         decision = self._run_approval_callback(
             False, prompt, "MCP elicitation", allow_permanent=True, cancel_on_unanswered=True,
-            allow_global_bypass=False,
+            allow_global_bypass=False, require_human=True,
             approval_tool_name="codex_mcp_elicitation",
             approval_key=self._approval_rule_key(
                 "codex_mcp_elicitation",
@@ -796,8 +804,11 @@ class CodexAppServerSession:
 
             decision = self._run_approval_callback(
                 False, prompt, "permissions request", allow_permanent=True,
-                approval_key=self._approval_rule_key("codex_permission", requested),
-                allow_global_bypass=False,
+                approval_key=self._approval_rule_key(
+                    "codex_permission",
+                    {"permissions": requested, "cwd": params.get("cwd") or self._cwd or ""},
+                ),
+                allow_global_bypass=False, require_human=True,
                 approval_tool_name="codex_permissions",
             )
         accepted = decision in {"accept", "acceptForSession"}
@@ -823,6 +834,7 @@ class CodexAppServerSession:
         approval_key: Optional[str] = None,
         cancel_on_unanswered: bool = False,
         allow_global_bypass: bool = True,
+        require_human: bool = False,
         approval_tool_name: Optional[str] = None,
     ) -> str:
         """Route a protocol approval through CLI or Hermes' shared Desktop/gateway gate.
@@ -846,6 +858,7 @@ class CodexAppServerSession:
                 rule_key=rule_key,
                 approval_callback=self._approval_callback,
                 allow_global_bypass=allow_global_bypass,
+                require_human=require_human,
             )
             if result.get("approved"):
                 return (

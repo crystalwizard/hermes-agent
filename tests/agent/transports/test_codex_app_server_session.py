@@ -803,6 +803,13 @@ class TestApprovalPromptEnrichment:
 
 
 class TestCodexServerRequestApprovals:
+    @pytest.fixture(autouse=True)
+    def _interactive_process(self, monkeypatch):
+        """The real Desktop/CLI process is interactive (tui_gateway sets HERMES_GATEWAY_SESSION, HERMES_EXEC_ASK
+        and HERMES_INTERACTIVE); tests/conftest.py strips them for isolation. Tests that need an unattended
+        process delete the flag explicitly."""
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
     def _run_request(self, method, *, params, callback=None, routing=None):
         client = FakeClient()
         scoped_params = {
@@ -869,7 +876,7 @@ class TestCodexServerRequestApprovals:
         assert client.responses == []
         assert client.error_responses[0][1] == -32602
 
-    def test_permission_requests_follow_human_and_policy_with_valid_protocol_grants(self):
+    def test_permission_requests_follow_human_and_policy_with_valid_protocol_grants(self, monkeypatch):
         requested = {
             "network": {"enabled": True},
             "fileSystem": {"write": ["F:/GPT Codex/projects/example"]},
@@ -892,7 +899,8 @@ class TestCodexServerRequestApprovals:
             "scope": "turn",
         })]
         assert "remove stale output" in captured["description"]
-        assert "network" in captured["command"] and "fileSystem" in captured["command"]
+        # The shared gate shows a generic label as the command; the requested profile is in the description.
+        assert "network" in captured["description"] and "fileSystem" in captured["description"]
         assert captured["allow_permanent"] is True
 
         denied = self._run_request(
@@ -905,10 +913,12 @@ class TestCodexServerRequestApprovals:
             "scope": "turn",
         })]
 
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
         unattended = self._run_request(
             "item/permissions/requestApproval",
             params={"permissions": {"network": {"enabled": True}}},
         )
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         assert unattended.responses == [("approval-1", {
             "permissions": {},
             "scope": "turn",
@@ -977,6 +987,7 @@ class TestCodexServerRequestApprovals:
         })]
         assert calls and calls[0][0] == "codex_permissions"
         assert calls[0][2]["allow_global_bypass"] is False
+        assert calls[0][2]["require_human"] is True
         assert calls[0][2]["rule_key"].startswith("codex_permission:")
 
     def test_permission_round_trips_through_real_gateway_queue(self, monkeypatch):
@@ -987,7 +998,6 @@ class TestCodexServerRequestApprovals:
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
         monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: True)
-        monkeypatch.setattr(approval, "is_approved", lambda *_args: False)
         cards = []
 
         def approve_once(data):
@@ -1003,9 +1013,12 @@ class TestCodexServerRequestApprovals:
                 "item/permissions/requestApproval",
                 params={"permissions": requested, "reason": "fetch dependency metadata"},
             )
-            assert cards and approval.is_approved(session_key, cards[0]["pattern_key"])
+            assert cards, "yolo must not skip the card for a permission request"
+            # 'once' is a one-time grant, not remembered.
+            assert not approval.is_approved(session_key, cards[0]["pattern_key"])
         finally:
             approval.unregister_gateway_notify(session_key)
+            approval.clear_session(session_key)
 
         assert client.responses == [("approval-1", {
             "permissions": requested,
@@ -1080,40 +1093,35 @@ class TestCodexServerRequestApprovals:
         })]
         assert calls and calls[0][0] == "codex_mcp_elicitation"
         assert calls[0][2]["allow_global_bypass"] is False
+        assert calls[0][2]["require_human"] is True
         assert calls[0][2]["rule_key"].startswith("codex_mcp_elicitation:")
 
     def test_permission_always_choice_is_remembered_by_exact_profile(self, monkeypatch):
         import tools.approval as approval
 
-        remembered = []
-        monkeypatch.setattr(approval, "is_approved", lambda *_args: False)
-        monkeypatch.setattr(
-            approval, "approve_session",
-            lambda session_key, rule_key: remembered.append(("session", session_key, rule_key)),
-        )
-        monkeypatch.setattr(
-            approval, "approve_permanent",
-            lambda rule_key: remembered.append(("permanent", rule_key)),
-        )
-        monkeypatch.setattr(
-            approval, "save_permanent_allowlist",
-            lambda patterns: remembered.append(("saved", patterns)),
-        )
+        session_key = "codex-always-choice-test"
+        saved = []
+        monkeypatch.setattr(approval, "get_current_session_key", lambda default="default": session_key)
+        monkeypatch.setattr(approval, "save_permanent_allowlist", lambda patterns: saved.append(set(patterns)))
         requested = {"network": {"enabled": True}}
-        client = self._run_request(
-            "item/permissions/requestApproval",
-            params={"permissions": requested},
-            callback=lambda *_a, **_kw: "always",
-        )
-
-        assert client.responses == [("approval-1", {
-            "permissions": requested,
-            "scope": "session",
-        })]
-        rule_keys = [entry[-1] for entry in remembered if entry[0] in {"session", "permanent"}]
-        assert len(set(rule_keys)) == 1
-        assert rule_keys[0].startswith("plugin_rule:codex_permission:")
-        assert any(entry[0] == "saved" and rule_keys[0] in entry[1] for entry in remembered)
+        try:
+            client = self._run_request(
+                "item/permissions/requestApproval",
+                params={"permissions": requested, "cwd": "F:/GPT Codex"},
+                callback=lambda *_a, **_kw: "always",
+            )
+            assert client.responses == [("approval-1", {
+                "permissions": requested,
+                "scope": "session",
+            })]
+            assert len(saved) == 1 and len(saved[0]) == 1
+            (rule_key,) = saved[0]
+            assert rule_key.startswith("plugin_rule:codex_permission:")
+            assert approval.is_approved(session_key, rule_key)
+        finally:
+            approval.clear_session(session_key)
+            with approval._lock:
+                approval._permanent_approved.discard(rule_key if "rule_key" in locals() else "")
 
     def test_remembered_permission_profile_does_not_prompt_again(self, monkeypatch):
         import tools.approval as approval
@@ -1130,7 +1138,7 @@ class TestCodexServerRequestApprovals:
             callback=lambda *_a, **_kw: pytest.fail("remembered approval prompted again"),
         )
 
-        assert checked and checked[0][1].startswith("codex_permission:")
+        assert checked and checked[0][1].startswith("plugin_rule:codex_permission:")
         assert client.responses == [("approval-1", {
             "permissions": requested,
             "scope": "session",
@@ -1154,7 +1162,8 @@ class TestCodexServerRequestApprovals:
             "content": {},
             "_meta": None,
         })]
-        assert "calendar-tools" in seen[0][0]
+        # Server name and message are carried in the description of the shared gate's card.
+        assert "calendar-tools" in seen[0][1]
         assert "Allow calendar access?" in seen[0][1]
 
     def test_unanswered_mcp_confirmation_is_cancel_not_user_decline(self):
@@ -1195,6 +1204,97 @@ class TestCodexServerRequestApprovals:
             "content": None,
             "_meta": None,
         })]
+
+    def test_hermes_tools_elicitation_is_accepted_even_with_tool_argument_fields(self):
+        """Hermes' own managed tools server never elicits user input: the fields in its traffic are tool-argument
+        schema (e.g. skill_view's name), not a form for a human. It keeps the long-standing auto-accept and never
+        reaches the human gate, while an external server with the very same schema is declined."""
+        from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
+
+        schema = {"type": "object", "properties": {"name": {"type": "string"}}}
+
+        def must_not_prompt(*_a, **_kw):
+            raise AssertionError("the internal hermes-tools server must not reach the human gate")
+
+        internal = self._run_request(
+            "mcpServer/elicitation/request",
+            params={"serverName": HERMES_TOOLS_MCP_SERVER_NAME, "mode": "form",
+                    "message": "skill_view", "requestedSchema": schema},
+            callback=must_not_prompt,
+        )
+        assert internal.responses == [("approval-1", {
+            "action": "accept", "content": None, "_meta": None,
+        })]
+
+        prompted = []
+        external = self._run_request(
+            "mcpServer/elicitation/request",
+            params={"serverName": "calendar-tools", "mode": "form",
+                    "message": "skill_view", "requestedSchema": schema},
+            callback=lambda *_a, **_kw: prompted.append(True) or "once",
+        )
+        assert prompted == []
+        assert external.responses == [("approval-1", {
+            "action": "decline", "content": None, "_meta": None,
+        })]
+
+    def test_lookalike_server_name_does_not_get_the_internal_special_case(self):
+        from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
+
+        prompted = []
+        client = self._run_request(
+            "mcpServer/elicitation/request",
+            params={"serverName": HERMES_TOOLS_MCP_SERVER_NAME + "-x", "mode": "form",
+                    "message": "m", "requestedSchema": {"type": "object", "properties": {"a": {"type": "string"}}}},
+            callback=lambda *_a, **_kw: prompted.append(True) or "once",
+        )
+        assert prompted == []
+        assert client.responses[0][1]["action"] == "decline"
+
+    def test_permission_key_covers_the_directory_but_not_the_reason_text(self, monkeypatch):
+        import tools.approval as approval
+
+        keys = []
+
+        def shared_gate(tool_name, reason, **kwargs):
+            keys.append(kwargs["rule_key"])
+            return {"approved": True, "message": None}
+
+        monkeypatch.setattr(approval, "request_tool_approval", shared_gate)
+        requested = {"network": {"enabled": True}}
+        for cwd, reason in (("F:/a", "first reason"), ("F:/b", "first reason"), ("F:/a", "another reason")):
+            self._run_request(
+                "item/permissions/requestApproval",
+                params={"permissions": requested, "cwd": cwd, "reason": reason},
+            )
+
+        assert len(keys) == 3
+        assert keys[0] != keys[1], "a remembered grant must not replay in a different directory"
+        assert keys[0] == keys[2], "free-text reason must not break remembering the same grant"
+
+    def test_permission_request_without_the_live_turn_id_is_rejected(self):
+        prompted = []
+        client = self._run_request(
+            "item/permissions/requestApproval",
+            params={"turnId": None, "permissions": {"network": {"enabled": True}}},
+            callback=lambda *_a, **_kw: prompted.append(True) or "once",
+        )
+        assert prompted == []
+        assert client.responses == []
+        assert client.error_responses == [(
+            "approval-1", -32602, "Server request does not belong to the active turn",
+        )]
+
+    def test_request_with_an_empty_thread_id_is_rejected(self):
+        prompted = []
+        client = self._run_request(
+            "mcpServer/elicitation/request",
+            params={"threadId": "", "serverName": "calendar-tools", "mode": "form",
+                    "requestedSchema": {"type": "object", "properties": {}}},
+            callback=lambda *_a, **_kw: prompted.append(True) or "once",
+        )
+        assert prompted == []
+        assert client.error_responses[0][1] == -32602
 
     def test_decline_policy_applies_to_hermes_tools_elicitations(self):
         prompted = []
