@@ -1144,6 +1144,51 @@ class TestCodexServerRequestApprovals:
             "scope": "session",
         })]
 
+    def test_remembered_grant_replays_headless_but_a_new_grant_still_needs_a_human(self, monkeypatch):
+        """Pins the policy: Always means always. A grant a person chose to remember for exactly this request
+        (profile + directory) replays with no person present; anything not remembered, including the same
+        profile in another directory, still fails closed when nobody is there."""
+        import tools.approval as approval
+
+        session_key = "codex-remembered-headless-test"
+        permanent_before = set(approval._permanent_approved)
+        monkeypatch.setattr(approval, "get_current_session_key", lambda default="default": session_key)
+        monkeypatch.setattr(approval, "save_permanent_allowlist", lambda patterns: None)
+        remembered = {"network": {"enabled": True}}
+        other = {"fileSystem": {"write": ["F:/elsewhere"]}}
+        granted = {"permissions": remembered, "scope": "session"}
+        refused = {"permissions": {}, "scope": "turn"}
+        try:
+            first = self._run_request(
+                "item/permissions/requestApproval",
+                params={"permissions": remembered, "cwd": "F:/GPT Codex"},
+                callback=lambda *_a, **_kw: "always",
+            )
+            assert first.responses == [("approval-1", granted)]
+
+            monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)  # nobody is present from here on
+            replay = self._run_request(
+                "item/permissions/requestApproval",
+                params={"permissions": remembered, "cwd": "F:/GPT Codex"},
+            )
+            assert replay.responses == [("approval-1", granted)]
+
+            new_profile = self._run_request(
+                "item/permissions/requestApproval",
+                params={"permissions": other, "cwd": "F:/GPT Codex"},
+            )
+            assert new_profile.responses == [("approval-1", refused)]
+
+            other_directory = self._run_request(
+                "item/permissions/requestApproval",
+                params={"permissions": remembered, "cwd": "F:/other"},
+            )
+            assert other_directory.responses == [("approval-1", refused)]
+        finally:
+            approval.clear_session(session_key)
+            with approval._lock:
+                approval._permanent_approved.intersection_update(permanent_before)
+
     def test_empty_schema_mcp_confirmation_asks_instead_of_auto_declining(self):
         seen = []
         client = self._run_request(
