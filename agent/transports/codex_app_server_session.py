@@ -733,13 +733,14 @@ class CodexAppServerSession:
         if not self._routing.ask_server_requests:
             # approvals.codex_server_requests: decline is a hard off, including for Hermes' own server.
             return {"action": "decline", "content": None, "_meta": None}
-        if server_name == HERMES_TOOLS_MCP_SERVER_NAME:
+        mode = params.get("mode") or "form"
+        if server_name == HERMES_TOOLS_MCP_SERVER_NAME and mode == "form":
             # Hermes' own managed tools server (exact name, thread/turn already verified above): opted in by
             # enabling the runtime and exposes nothing codex's shell cannot do. It never elicits user input, so
             # the fields in its traffic are tool-argument schema, not a form for a human to fill in. Keep the
-            # long-standing auto-accept; every OTHER server goes through the human gate below.
+            # long-standing auto-accept for FORM requests only; URL mode (and every OTHER server) is handled
+            # below like any other request.
             return {"action": "accept", "content": None, "_meta": None}
-        mode = params.get("mode") or "form"
         if mode not in {"form", "url"}:
             raise _InvalidServerRequestParams(f"Unsupported MCP elicitation mode: {mode}")
         if mode == "url":
