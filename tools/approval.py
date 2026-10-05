@@ -954,7 +954,7 @@ def _run_approval_gate(
     advice: str = "Find an alternative approach that avoids this action.",
     cron_deny_message: str = "", single_query_deny_message: str = "", unattended_deny_message: str = "",
     autoapprove_log_prefix: str, fail_closed_when_no_human: bool = False, no_human_block_message: str = "",
-    allow_global_bypass: bool = True,
+    allow_global_bypass: bool = True, require_human: bool = False,
 ) -> dict:
     """Shared human-approval gate for a flagged action (tool call or write): decision core for
     :func:`request_tool_approval` and the file-tool write gates.
@@ -981,6 +981,14 @@ def _run_approval_gate(
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
     if not is_cli and not is_gateway and not is_ask:
+        if require_human:
+            # A distinct consent protocol (e.g. a Codex permission profile) that a cron/unattended/single-query
+            # *approve* mode must never grant on its own: no human present means no grant.
+            logger.warning("%s (pattern: %s): %s — a human decision is required and none is present; "
+                           "BLOCKED (fail-closed).", autoapprove_log_prefix, pattern_key, description)
+            return _blocked(no_human_block_message or (
+                f"BLOCKED: approval required ({description}) but no interactive user or gateway is present "
+                "to approve it."), pattern_key=pattern_key, description=description)
         log_args = (autoapprove_log_prefix, pattern_key, description)
         # Every unattended context resolves instantly — never a pending approval nobody can answer.
         deny_messages = {
@@ -1102,6 +1110,7 @@ def request_tool_approval(
     rule_key: str = "",
     approval_callback=None,
     allow_global_bypass: bool = True,
+    require_human: bool = False,
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -1114,7 +1123,9 @@ def request_tool_approval(
     on the same tool persist independently. ``allow_global_bypass=False`` is for
     distinct consent protocols (for example a newly requested Codex permission
     profile) that must still reach a human when legacy command/tool approvals are
-    disabled. Returns the ``check_dangerous_command`` result shape.
+    disabled. ``require_human=True`` additionally refuses to let a cron / single-query / unattended
+    *approve* mode grant the request when no human is present (it fails closed instead).
+    Returns the ``check_dangerous_command`` result shape.
     """
     description = reason or f"Plugin requires approval for {tool_name}"
     if not rule_key:
@@ -1131,6 +1142,7 @@ def request_tool_approval(
         no_human_block_message=(f"BLOCKED: {subject} but no interactive user or gateway is present "
                                 "to approve it. A plugin flagged this action for human confirmation."),
         allow_global_bypass=allow_global_bypass,
+        require_human=require_human,
     )
 
 
