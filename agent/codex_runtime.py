@@ -10,7 +10,7 @@ import logging
 import os
 import threading
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
@@ -442,6 +442,32 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
 # --- Codex app-server turn ----------------------------------------------------
 
 
+@contextmanager
+def _codex_turn_activity_callback(agent):
+    """Bind ``agent._touch_activity`` as THIS thread's activity callback for the turn, then restore it.
+
+    The callback is thread-local and the native tool executor binds it on its workers. The codex turn thread
+    answers server requests (approvals) synchronously: without this binding the human-approval wait's ~10 s
+    heartbeat is a no-op and a card left unanswered past the liveness window gets the turn force-interrupted.
+    """
+    bound, previous = False, None
+    try:
+        from tools.environments.base import get_activity_callback, set_activity_callback
+        touch = getattr(agent, "_touch_activity", None)
+        if touch is not None:
+            previous = get_activity_callback()
+            set_activity_callback(touch)
+            bound = True
+    except Exception:
+        logger.debug("could not bind the activity callback for the codex turn", exc_info=True)
+    try:
+        yield
+    finally:
+        if bound:
+            with suppress(Exception):
+                set_activity_callback(previous)
+
+
 def _close_codex_session(agent) -> None:
     """Drop the session so the next turn respawns codex instead of reusing a dead client."""
     with suppress(Exception):
@@ -657,8 +683,9 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
                                   "without a truthful pre-compaction transcript boundary")
     _ensure_codex_session(agent, messages)
     try:
-        _start_codex_thread(agent)
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        with _codex_turn_activity_callback(agent):
+            _start_codex_thread(agent)
+            turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         _close_codex_session(agent)
