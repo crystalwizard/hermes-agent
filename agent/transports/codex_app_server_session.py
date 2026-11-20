@@ -10,6 +10,8 @@ reader threads feed queues that this adapter polls, like the chat_completions lo
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import logging
 import os
 import threading
@@ -23,7 +25,6 @@ from agent.transports.codex_app_server import (
     CodexAppServerClient, CodexAppServerError, CodexAppServerTransportError,
 )
 from agent.transports.codex_event_projector import CodexEventProjector, ProjectionResult
-from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +189,11 @@ class _ServerRequestRouting:
 
     auto_approve_exec: bool = False
     auto_approve_apply_patch: bool = False
+    ask_server_requests: bool = True
+
+
+class _InvalidServerRequestParams(ValueError):
+    """A supported server-request method received parameters Hermes cannot honor."""
 
 
 class CodexThreadResumeError(CodexAppServerError):
@@ -681,8 +687,7 @@ class CodexAppServerSession:
     def _handle_server_request(self, req: dict) -> None:
         """Answer a codex server request (approval / elicitation) via Hermes' approval flow.
 
-        Permission escalations are always declined (the user chose their profile in
-        ~/.codex/config.toml); unknown methods get a JSON-RPC error so codex doesn't hang.
+        Unknown methods get a JSON-RPC error so codex doesn't hang.
         """
         client = self._client
         if client is None:
@@ -695,22 +700,116 @@ class CodexAppServerSession:
             logger.warning("Unknown codex server request: %s", method)
             client.respond_error(rid, code=-32601, message=f"Unsupported method: {method}")
             return
-        client.respond(rid, handler(self, params))
+        if method in {"item/permissions/requestApproval", "mcpServer/elicitation/request"}:
+            if not isinstance(params, dict):
+                client.respond_error(rid, code=-32602, message="Server request params must be an object")
+                return
+            if params.get("threadId") != self._thread_id:
+                client.respond_error(
+                    rid, code=-32602,
+                    message="Server request does not belong to the active thread",
+                )
+                return
+            request_turn_id = params.get("turnId")
+            turn_id_required = method == "item/permissions/requestApproval"
+            if ((turn_id_required and request_turn_id != self._active_turn_id)
+                    or (request_turn_id is not None and request_turn_id != self._active_turn_id)):
+                client.respond_error(
+                    rid, code=-32602,
+                    message="Server request does not belong to the active turn",
+                )
+                return
+        try:
+            result = handler(self, params)
+        except _InvalidServerRequestParams as exc:
+            client.respond_error(rid, code=-32602, message=str(exc))
+            return
+        client.respond(rid, result)
 
     def _respond_elicitation(self, params: dict) -> dict:
-        """MCP elicitation: auto-accept our own hermes-tools server (opted in by enabling the runtime;
-        exposes nothing codex's shell can't do); decline others so the user opts in via codex's own flow."""
-        action = "accept" if (params.get("serverName") or "") == HERMES_TOOLS_MCP_SERVER_NAME else "decline"
-        return {"action": action, "content": None, "_meta": None}
+        """Route MCP consent through the same human approval surface as native Hermes MCP."""
+        server_name = params.get("serverName") or "<unknown>"
+        if not self._routing.ask_server_requests:
+            return {"action": "decline", "content": None, "_meta": None}
+        mode = params.get("mode") or "form"
+        if mode not in {"form", "url"}:
+            raise _InvalidServerRequestParams(f"Unsupported MCP elicitation mode: {mode}")
+        if mode == "url":
+            # URL mode requires a dedicated surface that shows the full destination,
+            # obtains explicit consent, and opens it outside the agent's inspection.
+            # A binary approval callback cannot complete that protocol safely.
+            return {"action": "decline", "content": None, "_meta": None}
+        schema = params.get("requestedSchema")
+        if mode == "form" and (
+            not isinstance(schema, dict)
+            or not isinstance(schema.get("properties"), dict)
+            or bool(schema["properties"])
+        ):
+            # The existing approval callback is binary; it cannot collect or validate
+            # structured MCP form data. Only an explicit empty-schema confirmation can
+            # be represented faithfully on this surface.
+            return {"action": "decline", "content": None, "_meta": None}
+
+        def prompt() -> tuple[str, str]:
+            message = params.get("message") or "This MCP server is requesting your approval."
+            detail = f"{message}\nMode: {mode}"
+            if isinstance(schema, dict) and isinstance(schema.get("properties"), dict):
+                fields = ", ".join(str(name) for name in schema["properties"])
+                if fields:
+                    detail += f"\nRequested fields: {fields}"
+            if params.get("url"):
+                detail += f"\nURL: {params['url']}"
+            return f"MCP elicitation from {server_name}", detail
+
+        decision = self._run_approval_callback(
+            False, prompt, "MCP elicitation", cancel_on_unanswered=True,
+        )
+        accepted = decision in {"accept", "acceptForSession"}
+        content = {} if accepted and (params.get("mode") or "form") != "url" else None
+        action = "accept" if accepted else "cancel" if decision == "cancel" else "decline"
+        return {"action": action, "content": content, "_meta": None}
+
+    def _respond_permissions_approval(self, params: dict) -> dict:
+        """Return Codex's granted-profile response, never the unrelated ``decision`` shape."""
+        requested = params.get("permissions")
+        requested = dict(requested) if isinstance(requested, dict) else {}
+        if not requested or not self._routing.ask_server_requests:
+            decision = "decline"
+        else:
+            def prompt() -> tuple[str, str]:
+                rendered = json.dumps(requested, ensure_ascii=False, sort_keys=True)
+                description = f"Codex requests additional permissions in {params.get('cwd') or self._cwd or '<unknown>'}"
+                if params.get("reason"):
+                    description += f" — {params['reason']}"
+                return f"Codex permissions: {rendered}", description
+
+            decision = self._run_approval_callback(
+                False, prompt, "permissions request", allow_permanent=True,
+                approval_key=self._approval_rule_key("codex_permission", requested),
+            )
+        accepted = decision in {"accept", "acceptForSession"}
+        return {
+            "permissions": requested if accepted else {},
+            "scope": "session" if decision == "acceptForSession" else "turn",
+        }
 
     _SERVER_REQUEST_HANDLERS: dict[str, Callable[..., dict]] = {
         "item/commandExecution/requestApproval": lambda self, p: {"decision": self._decide_exec_approval(p)},
         "item/fileChange/requestApproval": lambda self, p: {"decision": self._decide_apply_patch_approval(p)},
-        "item/permissions/requestApproval": lambda self, p: {"decision": "decline"},
+        "item/permissions/requestApproval": _respond_permissions_approval,
         "mcpServer/elicitation/request": _respond_elicitation,
     }
 
-    def _run_approval_callback(self, auto_approve: bool, prompt: Callable[[], tuple[str, str]], log_label: str) -> str:
+    def _run_approval_callback(
+        self,
+        auto_approve: bool,
+        prompt: Callable[[], tuple[str, str]],
+        log_label: str,
+        *,
+        allow_permanent: bool = False,
+        approval_key: Optional[str] = None,
+        cancel_on_unanswered: bool = False,
+    ) -> str:
         """Protocol routing only: auto-approve, fail-closed without a callback, else ask via ``prompt()``.
 
         Approval mode/timeout resolution lives upstream (codex_runtime.py derives the
@@ -718,15 +817,39 @@ class CodexAppServerSession:
         """
         if auto_approve:
             return "accept"
+        approval = None
+        session_key = ""
+        if approval_key:
+            from tools import approval as approval_module
+
+            approval = approval_module
+            session_key = approval.get_current_session_key(default="default")
+            if approval.is_approved(session_key, approval_key):
+                return "acceptForSession"
         if self._approval_callback is None:
             return "decline"
         command, description = prompt()
         try:
-            choice = self._approval_callback(command, description, allow_permanent=False)
+            choice = self._approval_callback(
+                command, description, allow_permanent=allow_permanent,
+            )
+            if cancel_on_unanswered and choice in {"timeout", "cancelled"}:
+                return "cancel"
+            if approval is not None and choice in {"session", "always"}:
+                approval.approve_session(session_key, approval_key)
+                if choice == "always":
+                    approval.approve_permanent(approval_key)
+                    approval.save_permanent_allowlist({approval_key})
             return _approval_choice_to_codex_decision(choice)
         except Exception:
             logger.exception("approval_callback raised on %s", log_label)
-            return "decline"
+            return "cancel" if cancel_on_unanswered else "decline"
+
+    @staticmethod
+    def _approval_rule_key(namespace: str, value: Any) -> str:
+        canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return f"{namespace}:{digest}"
 
     def _decide_exec_approval(self, params: dict) -> str:
         def prompt() -> tuple[str, str]:

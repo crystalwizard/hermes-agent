@@ -259,9 +259,11 @@ class TestPatchStaleness(unittest.TestCase):
         mock_ops.return_value = _make_fake_ops("original line\n", 15)
         read_file_tool(self._tmpfile, task_id="p1")
 
-        time.sleep(0.05)
+        previous_mtime = os.path.getmtime(self._tmpfile)
         with open(self._tmpfile, "w") as f:
             f.write("externally modified\n")
+
+        os.utime(self._tmpfile, (previous_mtime + 4, previous_mtime + 4))
 
         result = json.loads(patch_tool(
             mode="replace", path=self._tmpfile,

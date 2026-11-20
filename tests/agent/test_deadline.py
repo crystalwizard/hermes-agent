@@ -51,7 +51,7 @@ class TestClampTimeout:
 
     def test_oversized_value_clamped_to_platform_safe_max(self):
         # The #83220 class: >time_t deadlines crash Lock.acquire on macOS.
-        assert clamp_timeout(10**18) == MAX_SAFE_TIMEOUT_S
+        assert clamp_timeout(10**18) == min(MAX_SAFE_TIMEOUT_S, threading.TIMEOUT_MAX - 1.0)
 
     def test_clamped_value_safe_for_threading_primitives(self):
         # Regression proof for #83220: the clamped value itself must be

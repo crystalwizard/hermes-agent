@@ -621,6 +621,14 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     if blocked:
         return tool_error(blocked)
 
+    # browser-use executes a Python script in a local CLI process, even if
+    # the browser itself is remote. It must not bypass execute_code review.
+    from tools.approval import check_execute_code_guard
+    decision = check_execute_code_guard(code, env_type="local", has_host_access=True)
+    if not decision.get("approved"):
+        return tool_error(decision.get("message") or
+                          "BLOCKED: browser_exec code requires execution approval.")
+
     cmd = _find_cli()
     if not cmd:
         return tool_error("browser-use CLI not found on PATH, and uvx is unavailable for a zero-install run. "

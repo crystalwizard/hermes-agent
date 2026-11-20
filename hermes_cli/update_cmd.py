@@ -1546,6 +1546,27 @@ def _finish_pulled_update(
         node_failures=node_failures, update_complete=update_complete)
 
 
+def _refuse_update_with_dirty_checkout(checkout: Path) -> None:
+    """Source modifications are not in Hermes user-data backups; refuse dirty updates."""
+    if not (checkout / ".git").exists():
+        # Non-Git installers have their own dirty-tree guard in update_cmd_zip.
+        return
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=checkout, capture_output=True, text=True, timeout=20, check=False)
+    except Exception as exc:
+        raise RuntimeError("Cannot confirm source state before updating") from exc
+    if result.returncode:
+        raise RuntimeError("Cannot inspect local source changes before updating")
+    if result.stdout.strip():
+        raise RuntimeError(
+            "Refusing Hermes update: the source checkout has local modifications. "
+            "Hermes pre-update backups exclude the hermes-agent source directory, "
+            "so a successful snapshot does NOT preserve these patches. Commit or "
+            "otherwise reconcile the modifications before updating.")
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always restore stdio even on
     ``sys.exit``. Self-lock deferral deliberately does NOT run here (pre-fetch it stranded users
@@ -1572,6 +1593,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # reason, not as a failed step (see _record_pre_update_backup_outcome).
     pre_update_snapshot_id = _m()._run_pre_update_backup(args)
     _record_pre_update_backup_outcome(args, pre_update_snapshot_id)
+    # Do not stash away local source repairs without a restorable snapshot.
+    # This guard runs before any gateway pause, fetch, checkout or stash.
+    _refuse_update_with_dirty_checkout(_m().PROJECT_ROOT)
 
     # A legacy re-exec child resumes exactly the fleet its parent stopped; re-running discovery
     # here found the parent's just-relaunched gateway and force-killed it (#101600).

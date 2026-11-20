@@ -811,6 +811,26 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                                            session_key, human_present=is_cli or is_gateway or is_ask)
         if result is not None:
             return result
+    # Whole-script approval must describe the actual code being authorized.
+    # When forced redaction would hide executable content, an attended owner
+    # cannot meaningfully approve this exact script. Fail before presenting
+    # any potentially misleading permission card.
+    if pending_body is not None:
+        def deny_hidden_script(message: str) -> dict:
+            denied = _denied(
+                message, pattern_key=pattern_key, description=description,
+                outcome="blocked", noun=spec.noun,
+            )
+            if smart_denied:
+                denied["smart_denied"] = True
+            return denied
+        try:
+            if redact_sensitive_text(command, force=True) != command:
+                return deny_hidden_script(
+                    "BLOCKED: executable script contains content that would be hidden on its approval card.")
+        except Exception:
+            return deny_hidden_script(
+                "BLOCKED: cannot verify complete executable script display for approval.")
     pending_body = pending_body() if pending_body else None
     allow_permanent = permanent_capable and not smart_denied
 
@@ -1122,6 +1142,13 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
 
 # --- Combined pre-exec guard (tirith + dangerous command detection) -------------------------------------------------
 
+def _tirith_approval_key(command: str, finding: dict) -> str:
+    """Do not share one session grant across all scanner findings without rule IDs."""
+    rule_id = str(finding.get("rule_id") or "").strip()
+    digest = hashlib.sha256(command.encode("utf8", "surrogatepass")).hexdigest()[:24]
+    return "tirith:" + (rule_id if rule_id and rule_id != "unknown" else "unclassified") + ":" + digest
+
+
 def _format_tirith_description(tirith_result: dict) -> str:
     """Human-readable severity/title/description summary of tirith findings."""
     parts = []
@@ -1178,17 +1205,90 @@ def check_all_command_guards(command: str, env_type: str,
     approval_mode = approval_context._get_approval_mode()
     if _yolo_active() or approval_mode == "off":
         return _approved()
-    if _command_matches_permanent_allowlist(command):
+    # In smart mode, evaluate the actual command, not only detector hits.
+    # A historical pattern-level allowlist must never bypass this assessment.
+    if approval_mode != "smart" and _command_matches_permanent_allowlist(command):
+        # A permanent pattern grant is not authority to skip an independent
+        # security scanner.  Check the current command before granting it.
+        tirith = _tirith_scan(command)
+        if tirith.get("action") in {"warn", "block"}:
+            finding = (tirith.get("findings") or [{}])[0]
+            key = _tirith_approval_key(command, finding)
+            if is_approved(get_current_session_key(), key):
+                return _approved()
+            approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
+            if not (is_cli or is_gateway or is_ask):
+                return _denied(
+                    "BLOCKED: an allowlisted command has a new Tirith security finding "
+                    "but no attended approval surface is available.",
+                    pattern_key="tirith:allowlist", description=_format_tirith_description(tirith),
+                    outcome="blocked",
+                )
+            return _human_decision(
+                _COMMAND_GATE, command=command, description=_format_tirith_description(tirith),
+                pattern_key=key, pattern_keys=[key],
+                warnings=[(key, _format_tirith_description(tirith), True)],
+                session_key=get_current_session_key(), approval_callback=approval_callback,
+                is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
+                smart=False, permanent_capable=False,
+            )
         return _approved()
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
+    if approval_mode == "smart" and (is_cli or is_gateway or is_ask):
+        session_key = get_current_session_key()
+        smart_description = _smart_terminal_description(command)
+        human_present = is_cli or is_gateway or is_ask
+        if not human_present:
+            verdict, denied = _smart_gate(
+                _COMMAND_GATE, command, smart_description,
+                "smart:terminal", ["smart:terminal"], session_key,
+                human_present=False,
+            )
+            if verdict is not None:
+                return verdict
+        if not human_present:
+            return _denied(
+                ("BLOCKED: smart review did not approve this unattended host command "
+                 "(unattended platform, including webhook/api_server). "
+                 "The approvals.unattended_mode, approvals.cron_mode and "
+                 "approvals.single_query_mode settings do not override smart review; "
+                 "a functioning guardian or an operator policy change is required."),
+                pattern_key="smart:terminal", description=smart_description,
+                outcome="blocked",
+            )
+        return _human_decision(
+            _COMMAND_GATE, command=command, description=smart_description,
+            pattern_key="smart:terminal", pattern_keys=["smart:terminal"],
+            warnings=[("smart:terminal", None, True)], session_key=session_key,
+            approval_callback=approval_callback, is_cli=is_cli,
+            is_gateway=is_gateway, is_ask=is_ask, smart=True,
+            permanent_capable=False,
+        )
     # Outside CLI/gateway/ask flows we never block on approvals: each
     # unattended context applies its configured deny/approve mode, else allow.
     if not is_cli and not is_gateway and not is_ask:
-        for ctx in _unattended_contexts():
+        contexts = list(_unattended_contexts())
+        for ctx in contexts:
             result = _unattended_deny(command, ctx)
             if result is not None:
                 return result
+        # Explicit unattended permission does not bypass independent scanner
+        # warnings. Silence never constitutes consent to flagged commands.
+        scan = _tirith_scan(command)
+        if scan.get("action") in {"warn", "block"}:
+            finding = (scan.get("findings") or [{}])[0]
+            key = _tirith_approval_key(command, finding)
+            if not is_approved(get_current_session_key(), key):
+                return _denied(
+                    "BLOCKED: unattended scanner finding requires human review.",
+                    pattern_key=key,
+                    description=_format_tirith_description(scan),
+                    outcome="blocked",
+                )
+        if contexts:
+            # An explicit approve-mode context is an operator decision.
+            return _approved()
         return _approved()
 
     # Gather findings: warnings = [(pattern_key, description, is_tirith)]. Tirith block AND warn both go through the
@@ -1199,14 +1299,26 @@ def check_all_command_guards(command: str, env_type: str,
     session_key = get_current_session_key()
     if tirith_result["action"] in {"block", "warn"}:
         findings = tirith_result.get("findings") or []
-        rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
-        tirith_key = f"tirith:{rule_id}"
+        tirith_key = _tirith_approval_key(command, findings[0] if findings else {})
         if not is_approved(session_key, tirith_key):
             warnings.append((tirith_key, _format_tirith_description(tirith_result), True))
     if is_dangerous and not is_approved(session_key, pattern_key):
         warnings.append((pattern_key, description, False))
     if not warnings:
-        return _approved()
+        # Manual means an actual operator decision, not silently allowing
+        # commands the detector does not recognize as dangerous.
+        # Distinct keys prevent a previous session answer for one command
+        # from authorizing a different command.
+        manual_key = "manual:terminal:" + hashlib.sha256(command.encode("utf-8")).hexdigest()[:16]
+        return _human_decision(
+            _COMMAND_GATE, command=command,
+            description="Manual approval required for host command",
+            pattern_key=manual_key, pattern_keys=[manual_key],
+            warnings=[(manual_key, None, True)], session_key=session_key,
+            approval_callback=approval_callback, is_cli=is_cli,
+            is_gateway=is_gateway, is_ask=is_ask, smart=False,
+            permanent_capable=False,
+        )
 
     combined_desc = "; ".join(desc for _, desc, _ in warnings)
     primary_key = warnings[0][0]
@@ -1222,6 +1334,24 @@ def check_all_command_guards(command: str, env_type: str,
         is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask, smart=approval_mode == "smart",
         permanent_capable=any(not is_t for _, _, is_t in warnings),
     )
+
+
+def _smart_terminal_description(command: str) -> str:
+    """Preserve scanner findings as guardian context without limiting smart review to flagged commands."""
+    notes = ["Host command execution"]
+    try:
+        dangerous, key, description = detect_dangerous_command(command)
+        if dangerous:
+            notes.append(f"Dangerous-command rule: {description}")
+    except Exception:
+        notes.append("Dangerous-command detector unavailable")
+    try:
+        tirith = _tirith_scan(command)
+        if tirith.get("action") in ("warn", "block"):
+            notes.append(_format_tirith_description(tirith))
+    except Exception:
+        notes.append("Tirith assessment unavailable")
+    return "; ".join(notes)
 
 
 _EXECUTE_CODE_DESCRIPTION = (
@@ -1257,6 +1387,23 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     if _yolo_active() or approval_mode == "off":
         return _approved()
 
+    # Review every executable script in smart mode, regardless of context.
+    # In unattended sessions, a missing/indeterminate verdict is a denial.
+    approval_callback, is_cli, is_gateway, is_ask = _presence()
+    if approval_mode == "smart" and (is_cli or is_gateway or is_ask):
+        session_key = get_current_session_key()
+        command = f"execute_code <<'PY'\n{code}\nPY"
+        from agent.redact import redact_sensitive_text
+        return _human_decision(
+            _EXECUTE_CODE_GATE, command=command, description=description,
+            pattern_key="execute_code", pattern_keys=["execute_code"],
+            warnings=[("execute_code", None, True)], session_key=session_key,
+            approval_callback=approval_callback, is_cli=is_cli,
+            is_gateway=is_gateway, is_ask=is_ask, smart=True,
+            permanent_capable=False,
+            pending_body=lambda: f"**Code:**\n```python\n{redact_sensitive_text(code)}\n```",
+        )
+
     # (-q clears the presence flags, but its unattended context resolves first anyway.)
     approval_callback, is_cli, is_gateway, is_ask = _presence()
     # No user is present to approve arbitrary code in -q / cron / unattended
@@ -1275,7 +1422,7 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     # on every execute_code call. Ask-mode still takes this path even with INTERACTIVE set (how gateway/smart tests
     # and messaging ask-mode drive whole-script approval); when that leaks into a CLI with no notify callback, the
     # engine falls through to the CLI Dangerous Command panel instead of a silent pending_approval.
-    if not is_gateway and not is_ask:
+    if not (is_cli or is_gateway or is_ask):
         return _approved()
 
     session_key = get_current_session_key()
@@ -1284,8 +1431,8 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
 
     # Without this, "Approve session" / "Always" choices are stored but never
     # consulted, so every execute_code call re-prompts (#39275).
-    if is_approved(session_key, pattern_key):
-        return _approved()
+    # Every script is a separate approval. A session-level grant to a prior
+    # script must never authorize unrelated Python code.
 
     # Smart mode: an APPROVE only suppresses the redundant whole-script prompt; the per-call terminal() guards still
     # run independently. The gateway renders the pending payload to Discord/Slack, so the script body is redacted for
@@ -1295,7 +1442,7 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
         _EXECUTE_CODE_GATE, command=command, description=description, pattern_key=pattern_key,
         pattern_keys=[pattern_key], warnings=[(pattern_key, None, False)], session_key=session_key,
         approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
-        smart=approval_mode == "smart",
+        smart=approval_mode == "smart", permanent_capable=False,
         pending_body=lambda: f"**Code:**\n```python\n{redact_sensitive_text(code)}\n```",
     )
 

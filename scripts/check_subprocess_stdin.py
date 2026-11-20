@@ -202,6 +202,11 @@ def find_subprocess_calls(content: str, filepath: str) -> list[dict]:
     return violations
 
 
+def _repo_relative_posix(path: Path, root: Path) -> str:
+    """Use portable '/' keys for KNOWN_SAFE, even when executed on Windows."""
+    return path.relative_to(root).as_posix()
+
+
 def main() -> int:
     fix_mode = "--fix" in sys.argv
     repo_root = Path(__file__).resolve().parent.parent
@@ -220,7 +225,7 @@ def main() -> int:
             continue
 
         for py_file in dirpath.rglob("*.py"):
-            rel = str(py_file.relative_to(repo_root))
+            rel = _repo_relative_posix(py_file, repo_root)
 
             # Skip known-safe files.
             if rel in KNOWN_SAFE:
@@ -262,14 +267,14 @@ def main() -> int:
             all_violations.extend(violations)
 
     if all_violations:
-        print(f"❌ {len(all_violations)} subprocess calls missing stdin=:")
+        print(f"ERROR: {len(all_violations)} subprocess calls missing stdin=:")
         for v in all_violations:
             print(f"  {v['file']}:{v['line']}: {v['snippet']}")
         if fix_mode:
             print("\nAdd stdin=subprocess.DEVNULL to each call above.")
         return 1
     else:
-        print("✅ All TUI-context subprocess calls have explicit stdin=")
+        print("PASS: All TUI-context subprocess calls have explicit stdin=")
         return 0
 
 

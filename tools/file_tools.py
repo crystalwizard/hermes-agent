@@ -556,7 +556,7 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
             pass
         baselines = task_data["full_write_baselines"]
         if stable and version is not None and count < 4:
-            task_data["dedup"][dedup_key] = version_before
+            task_data["dedup"][dedup_key] = version
             # A narrower view does not undo knowledge of these same bytes. Do
             # not revive a baseline after a partial read of a different version.
             complete = baselines.get(resolved_str) == version
@@ -672,7 +672,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         file_ops = _get_file_ops(task_id)
         version_before = _file_metadata(resolved_str) if _file_ops_uses_host_paths(file_ops) else None
         if (cached_version is not None and not is_background_review()
-                and version_before == cached_version and content_served_in_generation):
+                and (version_before is not None and version_before == cached_version[:-1]
+                 and _file_version(resolved_str) == cached_version) and content_served_in_generation):
             return _dedup_stub_or_block(task_data, dedup_key, path)
 
         result = file_ops.read_file(resolved_str if _file_ops_uses_host_paths(file_ops) else path, offset, limit)
@@ -759,7 +760,7 @@ def _resolve_or_none(filepath: str, task_id: str) -> str | None:
 
 
 def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: str,
-                          cross_profile: bool) -> str | None:
+                          cross_profile: bool, *, change_text: str | None = None) -> str | None:
     """Run the shared write/patch guards in order; return the first error string.
 
     Order matters: hard denies (sensitive path, mirror) and the corruption
@@ -767,7 +768,7 @@ def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: s
     prompt covers every path of a multi-file patch.
     """
     for p in paths:
-        err = _check_sensitive_path(p, task_id) or (
+        err = _check_sensitive_path(p, task_id, change_text=change_text) or (
             None if cross_profile else _check_cross_profile_path(p, task_id))
         if err:
             return err
@@ -775,8 +776,8 @@ def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: s
         err = _check_binary_document_write(p, task_id)
         if err:
             return err
-    return (_check_protected_instruction_write(paths, task_id)
-            or _check_approval_required_write(paths, task_id))
+    return (_check_protected_instruction_write(paths, task_id, change_text=change_text)
+            or _check_approval_required_write(paths, task_id, change_text=change_text))
 
 
 def _edit_warnings(paths: list[str], path_to_resolved: dict, task_id: str) -> list[str]:
@@ -860,10 +861,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     cross-PROFILE guard it was named for no longer exists).
     """
     # write_file checks the binary-document guard before the mirror guard.
-    err = (_check_sensitive_path(path, task_id)
+    err = (_check_sensitive_path(path, task_id, change_text=content)
            or _check_binary_document_write(path, task_id)
-           or _check_protected_instruction_write([path], task_id)
-           or _check_approval_required_write([path], task_id)
+           or _check_protected_instruction_write([path], task_id, change_text=content)
+           or _check_approval_required_write([path], task_id, change_text=content)
            or (None if cross_profile else _check_cross_profile_path(path, task_id)))
     if not err and _is_internal_file_tool_content(content):
         err = ("Refusing to write internal read_file display text as file content. "
@@ -962,7 +963,10 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             return collected
         _paths_to_check += collected[0]
         _content_write_paths += collected[1]
-    precheck_err = _write_precheck_error(_paths_to_check, _content_write_paths, task_id, cross_profile)
+    proposed_change = (patch if mode == "patch"
+                       else ("REPLACE OLD:" + (old_string or "") + " WITH NEW:" + (new_string or "")))
+    precheck_err = _write_precheck_error(_paths_to_check, _content_write_paths, task_id,
+                                          cross_profile, change_text=proposed_change)
     if precheck_err:
         return tool_error(precheck_err)
     try:

@@ -111,6 +111,7 @@ class TestDetectDangerousRm:
             assert "delete" in desc.lower()
 
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX /tmp is not the Windows OS temp directory")
     def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self):
         with mock_patch("tempfile.gettempdir", return_value="/tmp"):
             for prefix in ("hermes-verify-", "hermes-ad-hoc-"):
@@ -124,7 +125,10 @@ class TestDetectDangerousRm:
         real_temp = tmp_path / "real-temp"
         real_temp.mkdir()
         linked_temp = tmp_path / "linked-temp"
-        linked_temp.symlink_to(real_temp, target_is_directory=True)
+        try:
+            linked_temp.symlink_to(real_temp, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"host filesystem cannot create test symlink: {exc}")
         basename = "hermes-verify-example.py"
 
         with mock_patch("tempfile.gettempdir", return_value=str(linked_temp)):
@@ -926,7 +930,7 @@ class TestWebhookApprovalExclusion:
         assert "unattended platform" in result["message"]
         assert "approvals.unattended_mode" in result["message"]
 
-    def test_webhook_dangerous_command_approves_when_opted_in(self, monkeypatch):
+    def test_webhook_unattended_approve_overrides_smart_without_human(self, monkeypatch):
         """approvals.unattended_mode: approve restores the old auto-approve path."""
         from tools.approval import check_all_command_guards
 
@@ -943,7 +947,7 @@ class TestWebhookApprovalExclusion:
         result = check_all_command_guards("sudo systemctl restart nginx", "local")
         assert result["approved"] is True
 
-    def test_webhook_safe_command_still_approves(self, monkeypatch):
+    def test_webhook_benign_headless_without_context_approves(self, monkeypatch):
         """Non-dangerous commands on unattended platforms are unaffected."""
         from tools.approval import check_all_command_guards
 
@@ -1944,7 +1948,9 @@ class TestTirithImportErrorFailOpenPolicy:
             "security": {"tirith_enabled": enabled, "tirith_fail_open": fail_open},
         }
         real_import = builtins.__import__
-        with _patch("builtins.__import__", side_effect=self._make_failing_import(real_import)):
+        # Explicit allowlist reaches the Tirith decision before manual-mode
+        # unmatched-command consent, so these still test import failure.
+        with _patch("tools.approval._command_matches_permanent_allowlist", return_value=True), _patch("builtins.__import__", side_effect=self._make_failing_import(real_import)):
             with _patch("hermes_cli.config.load_config_readonly", return_value=cfg):
                 with _patch("tools.approval.detect_dangerous_command", return_value=(False, None, None)):
                     with mock_patch.dict("os.environ", {"HERMES_INTERACTIVE": "1"}, clear=False):
@@ -1969,7 +1975,9 @@ class TestTirithImportErrorFailOpenPolicy:
             return "deny"
 
         real_import = builtins.__import__
-        with _patch("builtins.__import__", side_effect=self._make_failing_import(real_import)):
+        # Explicit allowlist reaches the Tirith decision before manual-mode
+        # unmatched-command consent, so these still test import failure.
+        with _patch("tools.approval._command_matches_permanent_allowlist", return_value=True), _patch("builtins.__import__", side_effect=self._make_failing_import(real_import)):
             with _patch("hermes_cli.config.load_config_readonly", return_value=cfg):
                 with _patch("tools.approval.detect_dangerous_command", return_value=(False, None, None)):
                     with mock_patch.dict("os.environ", {"HERMES_INTERACTIVE": "1"}, clear=False):
@@ -2057,10 +2065,11 @@ class TestApprovalPromptRedaction:
                     # No gateway notify callback registered -> pending fallback.
                     result = check_execute_code_guard(code, "local")
 
-        assert result.get("status") == "pending_approval"
+        assert result.get("approved") is False
+        assert "BLOCKED" in result.get("message", "")
         # The script's credential must not appear in the user-facing message.
         assert "sk-proj-abc123xyz4567890abcdef" not in result["message"]
-        assert "sk-proj-abc123xyz4567890abcdef" not in result["command"]
+        assert "sk-proj-abc123xyz4567890abcdef" not in result.get("command", "")
 
 
 class TestCliApprovalTimeoutClassifiedSeparately:

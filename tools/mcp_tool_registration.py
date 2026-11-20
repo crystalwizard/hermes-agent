@@ -34,9 +34,9 @@ _UTILITY_HANDLER_FACTORIES = {
 
 
 def _normalize_server_trust(value: Any) -> str:
-    """Config ``trust`` -> tier. None -> ``full`` (compat default); unrecognized -> ``untrusted`` (fail closed)."""
+    """Config ``trust`` -> tier. None -> ``untrusted`` (fail closed); explicit full requires an operator decision."""
     if value is None:
-        return _core._TRUST_FULL
+        return _core._TRUST_UNTRUSTED
     text = str(value).strip().lower()
     if text in (_core._TRUST_FULL, _core._TRUST_UNTRUSTED):
         return text

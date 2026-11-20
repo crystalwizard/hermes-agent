@@ -469,6 +469,10 @@ def get_container_exec_info() -> Optional[dict]:
     exec into the container instead of running locally. None when container mode is off, when
     already inside the container, or when HERMES_DEV=1 is set. Only FileNotFoundError is
     swallowed; other errors (permissions, malformed data) propagate."""
+    # On Windows, NixOS container-mode must never execute an
+    # arbitrary backend named by a writable file on that platform.
+    if os.name == "nt":
+        return None
     if os.environ.get("HERMES_DEV") == "1":
         return None
 
@@ -2279,7 +2283,12 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
     _warn_config_parse_failure(
         config_path, exc, fallback=fallback if lkg is not None else "defaults")
     if lkg is None:
-        return None
+        # An existing but invalid configuration must not silently regain broad
+        # default permissions merely because no good backup is available.
+        # Deliberate defaults require an explicit reset/ignore-user-config flow.
+        raise InvalidUserConfigError(
+            f"Cannot safely load {config_path}: invalid configuration and no usable last-known-good copy. "
+            "Repair config.yaml or explicitly run with --ignore-user-config.") from exc
     # save_config() stores the pre-expansion dict (templates preserved); the load path stores the
     # expanded one. Expand defensively — idempotent when already expanded.
     lkg_copy: Dict[str, Any] = _expand_env_vars(copy.deepcopy(lkg))
@@ -2357,7 +2366,16 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         if user_sig is not None:
             try:
                 with open(config_path, encoding="utf-8") as f:
-                    user_config = fast_safe_load(f) or {}
+                    user_config = fast_safe_load(f)
+                if user_config is None:
+                    # An existing blank/comment-only file may be an interrupted edit.
+                    # Do not silently erase the last loaded security restrictions.
+                    raise InvalidUserConfigError(
+                        f"Existing {config_path} has no configuration values; restore it "
+                        "or explicitly reset settings instead of silently using defaults.")
+                if not isinstance(user_config, dict):
+                    raise InvalidUserConfigError(
+                        f"Existing {config_path} must contain a YAML mapping.")
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})

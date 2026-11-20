@@ -520,16 +520,34 @@ def check_command_security(command: str) -> dict:
     # #41400). After _CIRCUIT_RETRY_S the breaker half-opens: exactly one caller claims the probe slot —
     # claiming re-arms _circuit_open_at under _breaker_lock, so concurrent callers see a fresh TTL and stay
     # fail-open — and falls through to a real scan below.
-    if _circuit_open:
+    # An exhausted Tirith subprocess circuit must never disable the separate
+    # native Windows fallback or explicit unsupported-platform fail-closed.
+    if _circuit_open and is_platform_supported():
         with _breaker_lock:
             if _circuit_open and time.monotonic() - _circuit_open_at < _CIRCUIT_RETRY_S:
-                return _verdict("allow", "tirith disabled (circuit breaker)")
+                return _fail(cfg["tirith_fail_open"],
+                             "tirith disabled (circuit breaker)",
+                             "tirith disabled by circuit breaker (fail-closed)")
             if _circuit_open:  # TTL expired: claim the single-flight probe slot for this window
                 _circuit_open_at = time.monotonic()
                 logger.info("tirith circuit breaker half-open: probing after %ds", _CIRCUIT_RETRY_S)
     # No binary for this platform, ever: skip the resolver so we never spawn.
     if not is_platform_supported():
-        return _verdict("allow")
+        if platform.system() == "Windows":
+            try:
+                from tools.windows_command_scan import scan_windows_command
+                native = scan_windows_command(command)
+                if not cfg["tirith_fail_open"]:
+                    return _verdict("block", "Tirith unavailable on Windows (fail-closed); "
+                                    + native["summary"], native["findings"])
+                if native["action"] != "allow":
+                    return native
+            except Exception:
+                logger.exception("Windows fallback command scan failed")
+                return _fail(cfg["tirith_fail_open"], "",
+                             "Windows fallback scan failed (fail-closed)")
+        return _fail(cfg["tirith_fail_open"], "",
+                     "Tirith unavailable on this platform (fail-closed)")
     tirith_path = _resolve_tirith_path(cfg["tirith_path"])
     timeout, fail_open = cfg["tirith_timeout"], cfg["tirith_fail_open"]
     if tirith_path is None:

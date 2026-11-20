@@ -142,7 +142,88 @@ def _resolved_or_raw(filepath: str, task_id: str) -> str:
         return filepath
 
 
-def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
+def _is_hermes_config_path(config: str, candidates) -> bool:
+    """Recognize alternate Windows names for the same protected config file."""
+    def norm(value: str) -> str:
+        value = os.path.normpath(value)
+        if os.name == "nt":
+            drive, rest = os.path.splitdrive(value)
+            rest = rest.split(":", 1)[0]
+            rest = os.sep.join(part if part in ("", ".", "..") else part.rstrip(" .")
+                               for part in rest.split(os.sep))
+            value = drive + rest
+        return os.path.normcase(value)
+    return any(norm(item) == norm(config) for item in candidates)
+
+
+def _windows_sensitive_write_reason(path: str) -> str | None:
+    """Classify Windows autorun and privileged write targets for one-time approval."""
+    if os.name != "nt":
+        return None
+    import ntpath
+    value = ntpath.normcase(ntpath.normpath(path))
+    parts = [((segment.rstrip(" .") if len(segment) == 2 and segment[1] == ":"
+               else segment.split(":", 1)[0].rstrip(" .")))
+             for segment in value.replace("/", "\\").split("\\")]
+    basename = parts[-1] if parts else ""
+    if any(parts[i:i + 4] == ["start menu", "programs", "startup", basename]
+           for i in range(max(0, len(parts) - 3))):
+        return "Windows startup entry"
+    if any(parts[i:i + 2] == [".git", "hooks"] for i in range(len(parts) - 1)):
+        return "Git hook"
+    if basename in (".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".zshrc", ".profile", ".gitconfig",
+                    "profile.ps1", "microsoft.powershell_profile.ps1"):
+        return "shell startup or configuration file"
+    if len(parts) >= 2 and parts[-2:] in ([".git", "config"], [".git", "config.worktree"]):
+        return "repository execution configuration"
+    if basename in (".gitattributes", ".gitmodules"):
+        return "repository execution configuration"
+    if len(parts) >= 3 and parts[-3:] == [".config", "git", "config"]:
+        return "Git execution configuration"
+    if any(parts[i:i+2] == ["microsoft", "windowsapps"] for i in range(len(parts)-1)):
+        return "user executable search path"
+    if any(parts[i:i+3] == ["appdata", "roaming", "npm"]
+           for i in range(len(parts)-2)):
+        return "user executable search path"
+    if any(parts[i:i + 2] in ([".cargo", "bin"], [".local", "bin"])
+           for i in range(len(parts) - 1)):
+        return "user executable search path"
+    if "scripts" in parts and any(segment.startswith("python") for segment in parts):
+        return "user executable search path"
+    if "powershell" in parts and basename.endswith("_profile.ps1"):
+        return "PowerShell profile"
+    if len(parts) >= 2 and parts[0] == "c:" and parts[1] in ("windows", "program files", "program files (x86)"):
+        return "system or installed-program file"
+    try:
+        from hermes_constants import get_hermes_home
+        home_parts = [segment.rstrip(" .") for segment in ntpath.normcase(
+            str(get_hermes_home())).replace("/", "\\").split("\\")]
+        if parts[:len(home_parts)] == home_parts and len(parts) > len(home_parts):
+            # Treat the Hermes home as executable/identity-bearing state by
+            # default.  A growing name list cannot protect future plugins,
+            # launchers, profiles or control files (independent audit F2).
+            relative = parts[len(home_parts):]
+            # Exceptions are strictly data-shaped, not "everything in cache".
+            # Unknown extensions and control-like names remain protected, even
+            # when placed beneath an otherwise writable media/log directory.
+            passive_suffixes = {
+                "logs": (".log", ".txt", ".jsonl"),
+                "audio_cache": (".wav", ".mp3", ".ogg", ".flac"),
+                "image_cache": (".png", ".jpg", ".jpeg", ".webp", ".gif"),
+            }
+            passive = passive_suffixes.get(relative[0])
+            if (len(relative) >= 2 and passive
+                    and all(not item.startswith(".") for item in relative[1:])
+                    and basename.endswith(passive)):
+                return None
+            return "Hermes persistent configuration, executable, or identity state"
+    except Exception:
+        # Unknown Hermes home must not silently downgrade write protection.
+        return "Hermes home classification unavailable"
+    return None
+
+
+def _check_sensitive_path(filepath: str, task_id: str = "default", *, change_text: str | None = None) -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     # NT/device-namespace guard on the RAW string, BEFORE the task-base join:
     # on POSIX a leading "\??\" reads as a relative segment and gets anchored
@@ -152,19 +233,78 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     nt_err = get_nt_namespace_error(filepath, verb="Write")
     if nt_err:
         return nt_err
-    candidates = (_resolved_or_raw(filepath, task_id), os.path.normpath(_expand_tilde(filepath)))
+    if os.name == "nt" and str(filepath).replace("/", chr(92)).startswith(chr(92) * 2):
+        # A UNC path can initiate SMB/NTLM authentication while being resolved.
+        # Obtain a human decision BEFORE _resolved_or_raw/realpath/stat touches it.
+        return _request_protected_instruction_approval(
+            [filepath], task_id, change_text=change_text,
+            subject="Windows network-share path",
+            why_always=("Network share resolution can contact a remote SMB server "
+                        "and disclose credentials; only approve a trusted destination."))
+    raw_path = os.path.normpath(_expand_tilde(filepath))
+    # A relative spelling is not a second independent host path: realpath()
+    # would anchor it to the tool process cwd (often the Hermes source tree)
+    # instead of the task's actual file-operation cwd. Keep the task-resolved
+    # path as the authority for relative writes.
+    resolved_path = _resolved_or_raw(filepath, task_id)
+    raw_candidates = ((resolved_path, raw_path) if os.path.isabs(raw_path)
+                      else (resolved_path,))
+    # realpath resolves junctions, short names and Windows trailing-space/dot aliases
+    # including the nearest existing ancestor for not-yet-created files.
+    candidates = raw_candidates + tuple(os.path.realpath(c) for c in raw_candidates)
+    if os.name == "nt":
+        candidates = candidates + tuple(c[4:] for c in candidates if c.startswith(chr(92)*2 + "?" + chr(92)))
+    if os.name == "nt":
+        import ntpath
+        if any(str(c).replace("/", chr(92)).startswith(chr(92) * 2) for c in candidates):
+            return _request_protected_instruction_approval(
+                [filepath], task_id, change_text=change_text, subject="Windows network-share path",
+                why_always="Shares can alias protected local files; every write requires approval.")
+        install = ntpath.normcase(ntpath.normpath(str(Path(__file__).resolve().parent.parent)))
+        for candidate in candidates:
+            candidate_norm = ntpath.normcase(ntpath.normpath(candidate))
+            if candidate_norm == install or candidate_norm.startswith(install + chr(92)):
+                return _request_protected_instruction_approval(
+                    [filepath], task_id, change_text=change_text, subject="Hermes harness source or runtime",
+                    why_always="This path can change Hermes executable behavior; every write needs owner approval.")
+    for candidate in candidates:
+        sensitive_reason = _windows_sensitive_write_reason(candidate)
+        if sensitive_reason:
+            return _request_protected_instruction_approval(
+                [filepath], task_id, change_text=change_text, subject=sensitive_reason,
+                why_always="This target may execute during startup or change privileged behavior; approve each write separately.")
     if any(c.startswith(_SENSITIVE_PATH_PREFIXES) or c in _SENSITIVE_EXACT_PATHS for c in candidates):
         return (
             f"Refusing to write to sensitive system path: {filepath}\n"
             "Use the terminal tool with sudo if you need to modify system files.")
+    # Existing NTFS hard links can name a protected file from an innocent path.
+    # A path-only comparison cannot distinguish the two directory entries.
+    # Require owner consent for ALL multi-link existing files rather than
+    # pretending an arbitrary link is safe based on its displayed name.
+    if os.name == "nt":
+        for candidate in candidates:
+            try:
+                info = os.stat(candidate)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                # Unknown filesystem identity must not turn an existing
+                # uncertain target into an implicitly approved write.
+                if os.path.lexists(candidate):
+                    return _request_protected_instruction_approval(
+                        [filepath], task_id, change_text=change_text, subject="file identity could not be verified")
+                continue
+            if info.st_nlink > 1 and os.path.isfile(candidate):
+                return _request_protected_instruction_approval(
+                    [filepath], task_id, change_text=change_text, subject="multi-link file write",
+                    why_always="A hard link can alias protected content; approve this write individually.")
     # approvals.mode and other security settings live in config.yaml; a
     # prompt-injected agent could silently disable exec approval by editing it.
     hermes_config = _get_hermes_config_resolved()
-    if hermes_config and hermes_config in candidates:
-        return (
-            f"Refusing to write to Hermes config file: {filepath}\n"
-            "Agent cannot modify security-sensitive configuration. "
-            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead.")
+    if hermes_config and _is_hermes_config_path(hermes_config, candidates):
+        return _request_protected_instruction_approval(
+            [os.path.basename(hermes_config)], task_id, change_text=change_text, subject="Hermes config file",
+            why_always="Approval is required for each write to security-sensitive configuration.")
     return None
 
 
@@ -247,11 +387,37 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     return None
 
 
+def _describe_proposed_change(change_text: str | None) -> str:
+    """Bounded owner-visible summary tied to the exact proposed UTF-8 content."""
+    if change_text is None:
+        return ""
+    import hashlib
+    raw = change_text.encode("utf-8", errors="surrogatepass")
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        from agent.redact import redact_sensitive_text
+        visible = redact_sensitive_text(change_text, force=True)
+    except Exception:
+        visible = "<preview unavailable>"
+    if visible != change_text:
+        visible = "<contains redacted or undisplayable content>"
+    else:
+        # Escape controls and template delimiters so the card cannot erase lines
+        # or substitute user-controlled brace expressions.
+        visible = "".join(ch if ch.isprintable() and ch not in "{}"
+                          else (chr(92) + "u" + format(ord(ch), "04x"))
+                          for ch in visible)
+        if len(visible) > 1400:
+            visible = visible[:1400] + " ... [preview truncated; hash covers all bytes]"
+    return ("\nProposed change: " + str(len(raw)) + " UTF-8 bytes; SHA-256 " +
+            digest + "; preview: " + visible)
+
+
 _APPROVAL_UNAVAILABLE = "requires approval but the approval subsystem is unavailable."
 _NO_HUMAN = "requires approval but no interactive user or gateway is present to approve it."
 
 
-def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default") -> str | None:
+def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default", *, subject: str = "protected agent-instruction file(s)", why_always: str = "These files steer future agent behavior; approval is always required (not bypassed by auto-approve).", change_text: str | None = None) -> str | None:
     """Ask the human to approve a write to protected instruction file(s); ``None`` when approved.
 
     Deliberately NOT routed through ``_run_approval_gate`` (honors --yolo and
@@ -259,18 +425,16 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     scope, fail-closed without a human channel.
     """
     targets = ", ".join(dict.fromkeys(reasons))
-    description = (
-        f"Write to protected agent-instruction file(s): {targets}. "
-        "These files steer future agent behavior; approval is always "
-        "required (not bypassed by auto-approve).")
+    description = f"Write to {subject}: {targets}. {why_always}" + _describe_proposed_change(change_text)
     display = f"<write to {targets}>"
-    blocked = (
-        f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
-        "{why} The user has NOT consented to this write. Do NOT retry it or "
-        "attempt the same edit via another path (terminal, execute_code, "
-        "etc.).")
-    timed_out = blocked.format(why="approval prompt timed out without a user response. Silence is not consent.")
-    denied = blocked.format(why="was denied by the user.")
+    blocked_prefix = f"BLOCKED: write to {subject} ({targets}) "
+    blocked_suffix = (" The user has NOT consented to this write. Do NOT retry it or "
+                      "attempt the same edit via another path (terminal, execute_code, "
+                      "etc.).")
+    def _blocked(reason: str) -> str:
+        return blocked_prefix + reason + blocked_suffix
+    timed_out = _blocked( "approval prompt timed out without a user response. Silence is not consent.")
+    denied = _blocked( "was denied by the user.")
 
     try:
         import tools.approval as _approval
@@ -278,7 +442,7 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
         from tools.approval_gateway_wait import _await_gateway_decision
         from tools.approval_prompt import prompt_dangerous_approval
     except Exception:
-        return blocked.format(why=_APPROVAL_UNAVAILABLE)
+        return _blocked( _APPROVAL_UNAVAILABLE)
 
     # Gateway surface: block on the button round-trip when a notify callback
     # is registered for this session. One-operation only — no scope buttons.
@@ -299,9 +463,9 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
             "allow_session": False}
         decision = _await_gateway_decision(session_key, notify_cb, approval_data, surface="gateway")
         if decision.get("notify_failed"):
-            return blocked.format(why="requires approval but the approval request could not be delivered.")
+            return _blocked( "requires approval but the approval request could not be delivered.")
         if decision.get("cancelled"):
-            return blocked.format(why=f"approval was withdrawn before the user answered ({decision['cancelled']}).")
+            return _blocked( f"approval was withdrawn before the user answered ({decision['cancelled']}).")
         choice, timed = decision.get("choice"), not decision.get("resolved")
     else:
         # CLI surface: per-thread approval callback (prompt_toolkit panel).
@@ -313,11 +477,11 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
         if callback is None:
             # No human channel (script, cron, background thread): fail closed —
             # auto-approving here would recreate the persistence vector.
-            return blocked.format(why=_NO_HUMAN)
+            return _blocked( _NO_HUMAN)
         choice = prompt_dangerous_approval(
             display, description, allow_permanent=False, allow_session=False, approval_callback=callback)
         if choice == "cancelled":
-            return blocked.format(why="approval prompt could not be delivered or was not answered "
+            return _blocked( "approval prompt could not be delivered or was not answered "
                                       f"({getattr(choice, 'cause', 'no answer')}).")
         timed = choice == "timeout"
     # Any tapped scope is a one-operation grant; nothing is persisted.
@@ -326,7 +490,7 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     return timed_out if timed else denied
 
 
-def _check_protected_instruction_write(paths: list[str], task_id: str = "default") -> str | None:
+def _check_protected_instruction_write(paths: list[str], task_id: str = "default", *, change_text: str | None = None) -> str | None:
     """Gate a write/patch touching protected instruction files. ONE protected file gates
     the ENTIRE multi-file patch (one prompt, all-or-nothing)."""
     enabled, extra = _protected_instruction_config()
@@ -336,10 +500,10 @@ def _check_protected_instruction_write(paths: list[str], task_id: str = "default
                            for p in paths) if r]
     if not reasons:
         return None
-    return _request_protected_instruction_approval(reasons, task_id)
+    return _request_protected_instruction_approval(reasons, task_id, change_text=change_text)
 
 
-def _check_approval_required_write(paths: list[str], task_id: str = "default") -> str | None:
+def _check_approval_required_write(paths: list[str], task_id: str = "default", *, change_text: str | None = None) -> str | None:
     """Gate a write/patch touching an approval-required path (``~/.ssh/config`` can steer
     execution via ``ProxyCommand``). Routine gate: once/session/always, honors --yolo,
     fail-closed without an interactive/gateway channel."""
@@ -356,33 +520,34 @@ def _check_approval_required_write(paths: list[str], task_id: str = "default") -
     description = (
         f"Write to SSH client config file(s): {display_targets}. "
         "The SSH config can carry ProxyCommand / Match exec directives that "
-        "run commands, so writes require your approval.")
-    blocked = (
-        f"BLOCKED: write to SSH config file(s) ({display_targets}) "
-        "{why} Do NOT retry it via another path (terminal, execute_code) "
-        "without the user's explicit consent.")
+        "run commands, so writes require your approval.") + _describe_proposed_change(change_text)
+    blocked_prefix = f"BLOCKED: write to SSH config file(s) ({display_targets}) "
+    blocked_suffix = (" Do NOT retry it via another path (terminal, execute_code) "
+                      "without the user's explicit consent.")
+    def _blocked(reason: str) -> str:
+        return blocked_prefix + reason + blocked_suffix
 
     try:
         import tools.approval as _approval
     except Exception:
-        return blocked.format(why=_APPROVAL_UNAVAILABLE)
+        return _blocked( _APPROVAL_UNAVAILABLE)
 
     result = _approval._run_approval_gate(
         pattern_key="ssh_config_write",
         description=description,
         display_target=f"<write to {display_targets}>",
-        cron_deny_message=blocked.format(why="requires approval but this cron session denies it."),
-        single_query_deny_message=blocked.format(
-            why="requires approval but single-query (-q) sessions run "
+        cron_deny_message=_blocked( "requires approval but this cron session denies it."),
+        single_query_deny_message=_blocked(
+            "requires approval but single-query (-q) sessions run "
                 "without a user present to approve it. To allow flagged "
                 "actions in single-query mode, set approvals.single_query_mode: "
                 "approve in config.yaml."),
         autoapprove_log_prefix="ssh_config_write",
         fail_closed_when_no_human=True,
-        no_human_block_message=blocked.format(why=_NO_HUMAN))
+        no_human_block_message=_blocked( _NO_HUMAN))
     if result.get("approved"):
         return None
-    return result.get("message") or blocked.format(why="was denied.")
+    return result.get("message") or _blocked( "was denied.")
 
 
 def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | None:

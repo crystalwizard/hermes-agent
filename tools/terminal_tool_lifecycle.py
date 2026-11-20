@@ -273,8 +273,15 @@ def cleanup_all_environments():
         except Exception as e:
             logger.error("Error cleaning %s: %s", task_id, e, exc_info=True)
 
-    # Also clean any orphaned directories
-    for path in _scratch_paths():
+    # Also clean orphaned directories. At shutdown the configured home may be
+    # inaccessible (for instance, a stale profile/sandbox mount); do not
+    # turn a best-effort orphan scan into an unhandled atexit exception.
+    try:
+        orphan_paths = _scratch_paths()
+    except OSError as exc:
+        logger.warning("Cannot inspect sandbox orphan paths during cleanup: %s", exc)
+        orphan_paths = []
+    for path in orphan_paths:
         with _quiet("Failed to remove orphaned path %s", path, exc=OSError):
             shutil.rmtree(path, ignore_errors=True)
             logger.info("Removed orphaned: %s", path)

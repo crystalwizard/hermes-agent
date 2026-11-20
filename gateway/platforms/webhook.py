@@ -50,10 +50,10 @@ _BUILTIN_DELIVER_PLATFORMS = {
     "homeassistant", "email", "dingtalk", "feishu", "wecom", "wecom_callback", "weixin",
     "bluebubbles", "qqbot", "yuanbao"}
 
-# ``None`` → aiohttp binds BOTH address families. "0.0.0.0" is IPv4-only (unreachable on IPv6-only
+# Explicit host="*" maps to None: aiohttp binds BOTH address families. "0.0.0.0" is IPv4-only (unreachable on IPv6-only
 # networks such as Fly.io 6PN); "::" becomes IPv6-only where the kernel sets IPV6_V6ONLY=1, breaking
-# the 127.0.0.1 health check. Users can pin a host via ``platforms.webhook.extra.host``.
-DEFAULT_HOST = None
+# the 127.0.0.1 health check. Missing host stays loopback; public hosting must be explicit.
+DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
@@ -164,8 +164,11 @@ class WebhookAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WEBHOOK)
         extra = config.extra
-        # Empty string / null host normalises to None ("bind all families").
-        self._host: Optional[str] = extra.get("host", DEFAULT_HOST) or None
+        # The default is loopback. Public dual-stack exposure requires an explicit
+        # host="*" opt-in, which opens both IPv4 and IPv6 as aiohttp host=None.
+        configured_host = extra.get("host")
+        self._host: Optional[str] = (None if configured_host == "*"
+                                     else configured_host or DEFAULT_HOST)
         self._port: int = int(extra.get("port", DEFAULT_PORT))
         self._global_secret: str = extra.get("secret", "")
         self._static_routes: Dict[str, dict] = extra.get("routes", {})

@@ -36,6 +36,7 @@ approvals:
   cron_mode: deny                 # deny | approve — what cron jobs do when they hit a dangerous command
   single_query_mode: deny         # deny | approve — what single-query (-q) sessions do on a dangerous command
   unattended_mode: deny           # deny | approve — what webhook/API sessions do on a dangerous command
+  codex_server_requests: ask      # ask | decline — additional Codex permissions and MCP elicitations
   mcp_reload_confirm: true        # /reload-mcp asks before invalidating the MCP tool cache
   destructive_slash_confirm: true # /clear, /new, /reset, /undo prompt before discarding state
 ```
@@ -49,17 +50,20 @@ The full set of keys:
 | `cron_mode` | `deny` | How [cron jobs](./features/cron.md) behave headlessly when they trigger a dangerous-command prompt. `deny` blocks the command (the agent must find another path); `approve` auto-approves everything in cron context. |
 | `single_query_mode` | `deny` | How one-shot [`hermes chat -q`](./cli.md) sessions behave when they trigger a dangerous-command prompt. A `-q` session runs a single turn and exits with no user waiting to answer prompts; `deny` blocks the command (the agent must find another path), `approve` auto-approves everything in single-query context. Mirrors `cron_mode`. |
 | `unattended_mode` | `deny` | How sessions on unattended programmatic platforms (webhook, msgraph_webhook, api_server) behave when they trigger a dangerous-command prompt. These surfaces have no human who can answer `/approve`, so instead of blocking for the full approval timeout, `deny` blocks the command instantly (the agent must find another path) and `approve` auto-approves everything in unattended context. Mirrors `cron_mode`. |
+| `codex_server_requests` | `ask` | How the Codex app-server runtime handles requests for additional filesystem/network permissions and MCP elicitations. `ask` routes permission profiles and empty-form confirmations through Hermes's approval surface when a person can answer; sessions without an interactive callback still fail closed. Permission profiles offer once/session/always choices, and an always approval is remembered only for the exact requested profile. Structured forms and URL-mode elicitations are declined until Hermes has dedicated secure UI for them. `decline` rejects all of these request families without prompting. Invalid values also fail closed. |
 | `mcp_reload_confirm` | `true` | When true, `/reload-mcp` asks before rebuilding the MCP tool set. Rebuilding invalidates the provider prompt cache (tool schemas live in the system prompt), so the next message re-sends full input tokens. Users who click **Always Approve** flip this key to `false`. |
 | `destructive_slash_confirm` | `true` | When true, destructive session slash commands (`/clear`, `/new`, `/reset`, `/undo`) prompt before discarding conversation state. Three-option dialog (Approve Once / Always Approve / Cancel) routed through native yes/no buttons on Telegram, Discord, and Slack; text fallback elsewhere. Users who click **Always Approve** flip this key to `false`. The TUI also honors this setting for its `/clear`, `/new`, and `/reset` modal; `HERMES_TUI_NO_CONFIRM=1` force-skips that modal regardless of the configured value. |
 
 | Mode | Behavior |
 |------|----------|
 | **smart** (default) | Use an auxiliary LLM to assess risk. Low-risk commands (e.g., `python -c "print('hello')"`) are auto-approved for that command only. Genuinely dangerous commands are auto-denied. Uncertain cases escalate to a manual prompt. |
-| **manual** | Always prompt the user for approval on dangerous commands. |
+| **manual** | Host commands require attended approval, even when no dangerous pattern matches; without an approval surface they fail closed. |
 | **off** | Disable all approval checks — equivalent to running with `--yolo`. All commands execute without prompts. |
 
 :::warning
-Setting `approvals.mode: off` disables all safety prompts. Use only in trusted environments (CI/CD, containers, etc.).
+Setting `approvals.mode: off` disables ordinary command and file-change safety prompts. It does not silently grant
+additional Codex permission profiles or MCP consent; those remain governed by `codex_server_requests`. Use `off`
+only in trusted environments (CI/CD, containers, etc.).
 :::
 
 ### YOLO Mode
@@ -196,6 +200,8 @@ approvals:
   timeout: 300  # seconds (default: 300)
 ```
 
+`timeout: 0` means **immediate timeout/denial**, not an unlimited wait. Invalid timeout values fall back to 300 seconds; this is not an indefinite approval window.
+
 ### What Triggers Approval
 
 The following patterns trigger approval prompts (defined in `tools/approval.py`):
@@ -270,13 +276,14 @@ The `HERMES_EXEC_ASK=1` environment variable is automatically set when running t
 
 ### Permanent Allowlist
 
-Commands approved with "always" are saved to `~/.hermes/config.yaml`:
+Commands and exact Codex permission profiles approved with "always" are saved to `~/.hermes/config.yaml`:
 
 ```yaml
 # Permanently allowed dangerous command patterns
 command_allowlist:
   - rm
   - systemctl
+  - codex_permission:<sha256-of-the-canonical-profile>
 ```
 
 These patterns are loaded at startup and silently approved in all future sessions.
@@ -821,11 +828,11 @@ security:
   tirith_fail_open: true     # Allow execution when tirith is unavailable (default: true)
 ```
 
-When `tirith_fail_open` is `true` (default), commands proceed if tirith is not installed or times out. Set to `false` in high-security environments to block commands when tirith is unavailable.
+When `tirith_fail_open` is `true` (default), a missing or timed-out Tirith subprocess does not by itself block a command. Other approval layers still apply. Set it to `false` for fail-closed behavior when Tirith is unavailable, recognizing this will block commands on Windows, where Tirith has no native binary.
 
 Three consecutive operational failures (spawn error, timeout, crash) suspend scanning for five minutes so a broken binary cannot stall every command; after that window one command re-probes tirith, and any completed scan (allow, warn or block) resumes normal scanning. A probe that fails again re-arms the five-minute window.
 
-Tirith ships prebuilt binaries for Linux (x86_64 / aarch64) and macOS (x86_64 / arm64). On platforms with no prebuilt binary (Windows, etc.), tirith is silently skipped — pattern-matching guards still run, and the CLI does not surface an "unavailable" banner. To use tirith on Windows, run Hermes under WSL.
+Tirith ships prebuilt binaries for Linux (x86_64 / aarch64) and macOS (x86_64 / arm64), but **not Windows**. On Windows Hermes runs a separate, no-install **limited Python heuristic**, not the Tirith rule engine. It flags obvious punycode or mixed-script URL hosts, download-to-interpreter pipelines, encoded PowerShell commands, and expression-execution primitives. A flagged command is sent to the approval decision; an unflagged command is **not certified safe**. With `tirith_fail_open: false`, Windows fails closed even when this limited heuristic sees nothing. The heuristic does not provide parity with Tirith or protection against all obfuscations. To run the actual Tirith binary, use a supported operating system such as Linux under WSL.
 
 Tirith's verdict integrates with the approval flow: safe commands pass through, while both suspicious and blocked commands trigger user approval with the full tirith findings (severity, title, description, safer alternatives). Users can approve or deny — the default choice is deny to keep unattended scenarios secure.
 
@@ -970,3 +977,22 @@ security:
 ```
 
 When disabled, backends that need optional deps will tell the user to run the install manually (`pip install …`) or pick a different backend via `hermes tools`.
+
+
+## Reed Windows 3.12 security release notes — October 2026
+
+These notes describe observed behavior and known limits; **they do not constitute permission to start the agent**.
+
+- **Manual commands:** `approvals.mode: manual` asks for a human decision on every attended host command, including commands not matched by the dangerous-pattern detector. A previous decision for one command must not silently authorize another.
+- **Unattended work:** the separate `cron_mode`, `single_query_mode`, and `unattended_mode` switches remain authoritative for their respective unattended contexts; smart mode does not override those choices. With *no* unattended context and *no* human approval surface, legacy behavior approves host commands and `execute_code`. This is intentional owner-selected Ari parity, **not** a universal safety guarantee. The default cron and one-shot settings remain deny. Set the appropriate context to deny if unattended execution must be prohibited.
+- **MCP trust:** unconfigured MCP servers are treated as untrusted. `readOnlyHint` metadata alone cannot establish permission to bypass the consent gate.
+- **Webhook binding:** absent, empty or null host resolves to `127.0.0.1` (loopback); a deliberate `host: "*"` is needed for a public bind. Confirm the exposure implications before changing it.
+- **Media and writes:** strict media delivery and protected file-write approval default to enabled. These changes may require a user decision on writes formerly performed without a card.
+- **Windows native command scan:** Tirith has no native Windows release; the in-process `windows_command_scan.py` is a **limited heuristic, not Tirith parity**. It checks examples such as encoded PowerShell, internationalized domains and download-to-interpreter patterns, including `/` and Unicode dash PowerShell argument prefixes. It will not detect every risky command. Known unflagged patterns include download-then-execute sequences, certutil/bitsadmin fetches, certain UNC script forms, some mixed-script/width lookalikes, and obfuscated expression execution. A lack of findings **never certifies a command safe**. Setting Tirith fail-open false on unsupported Windows can block *every* host command; an open Tirith circuit on supported platforms with fail-open false similarly denies during the retry period.
+- **Updates:** `hermes update` refuses a dirty source checkout before fetching, resetting, stashing or pausing the gateway. Reed's audited checkout is dirty; preserve the exact source changes and agree on a release/commit plan before attempting an update.
+- **Python runtime:** Reed's `venv` uses Python 3.12.10 based on `E:\python-3-12-10`. Losing that E: interpreter may break launchers. An older 3.11.16 venv is retained separately for rollback; do not delete it as casual cleanup.
+- **Linux:** the limited Windows fallback is not used on supported Linux; Tirith's Linux binary may be automatically obtained when enabled, and the no-cosign installation fallback carries supply-chain provenance limitations. Linux availability and test coverage do not establish macOS verification.
+
+Two policy boundaries remain distinct from the completed Windows security repairs: **F4**, whether an explicit unattended `approve` policy should subject both allowlisted and unlisted commands to the same scanner handling, and **F13**, whether prompt-only cron jobs or expanded toolsets/workdirs/delivery should require an additional creation/update approval card. The current code's behavior must not be silently rewritten while interpreting these questions. Escalate any proposed change to the owner with its specific effects, then test only the chosen policy.
+
+Independent bounded adversarial checks passed on Reed's real Python 3.12.10 runtime, but full-repository sweeps and live gateway, real guardian, desktop cards, external webhook and updater actions remain outside that test evidence. Tests skipped because of OS constraints are **unexecuted**, not passed.

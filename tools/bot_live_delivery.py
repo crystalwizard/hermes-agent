@@ -13,7 +13,7 @@ import os
 import re
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 
 from utils import atomic_json_write, atomic_write_text, fsync_directory
 from pathlib import Path
@@ -29,18 +29,77 @@ _OWNER_KEYS = ("profile_home", "session_id", "lease_id", "live_session_id")
 _TERMINAL = frozenset({"settled", "failed", "cancelled", "ambiguous"})
 
 
+TARGET_FILE_NAME = "bot_live_delivery_target.json"
+
+
+def _target_path(home: Path | str) -> Path:
+    # Beside, never inside, the mailbox dir: the claim scans glob every ``*.json`` in it.
+    return Path(home).resolve() / "runtime" / TARGET_FILE_NAME
+
+
+def set_delivery_target(profile_home: Path | str, session_id: str) -> None:
+    """Name the chat that receives deliveries instead of the "Bot Chat" session (an explicit,
+    visible, reversible switch; clear it with ``clear_delivery_target``)."""
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError("session_id must be a non-empty string")
+    path = _target_path(profile_home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json_write(path, {"session_id": session_id.strip(), "set_at": time.time()})
+
+
+def clear_delivery_target(profile_home: Path | str) -> None:
+    with suppress(FileNotFoundError):
+        _target_path(profile_home).unlink()
+
+
+def delivery_target_state(profile_home: Path | str) -> tuple[str, str | None]:
+    """("absent", None) when no target file exists (Bot Chat behavior applies); ("set", session_id)
+    for a usable one; ("invalid", None) when the file exists but cannot be read or has no usable
+    session id. Invalid means FAIL CLOSED: a meeting must never silently redirect to Bot Chat."""
+    path = _target_path(profile_home)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "absent", None
+    except OSError:
+        return "invalid", None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return "invalid", None
+    value = data.get("session_id") if isinstance(data, dict) else None
+    if isinstance(value, str) and value.strip():
+        return "set", value.strip()
+    return "invalid", None
+
+
+def read_delivery_target(profile_home: Path | str) -> str | None:
+    """The explicitly targeted session id, or None (absent or invalid; use ``delivery_target_state``
+    to tell them apart)."""
+    return delivery_target_state(profile_home)[1]
+
+
 def find_canonical_owner(profile_home: Path | str) -> dict[str, Any] | None:
-    """Return the exact Bot Chat tip's lease, including unsupported CLI owners."""
+    """Return the lease of the delivery target's tip: the explicitly targeted chat when
+    ``set_delivery_target`` named one, else the exact Bot Chat tip. Includes unsupported CLI owners.
+    A named target that is not live, or a target file that exists but is unusable, returns None
+    (it never falls back to Bot Chat)."""
     from hermes_cli.active_sessions import active_session_registry_snapshot
     from hermes_state import SessionDB
 
     home = Path(profile_home).resolve()
     if not (home / "state.db").is_file():
         return None
+    target_state, wanted = delivery_target_state(home)
+    if target_state == "invalid":
+        return None
     db = SessionDB(db_path=home / "state.db", read_only=True)
     try:
-        row = db.get_session_by_title("Bot Chat")
-        session_id = db.get_compression_tip(row["id"]) if row else None
+        if wanted:
+            session_id = db.get_compression_tip(wanted) or wanted
+        else:
+            row = db.get_session_by_title("Bot Chat")
+            session_id = db.get_compression_tip(row["id"]) if row else None
     finally:
         db.close()
     if not session_id:

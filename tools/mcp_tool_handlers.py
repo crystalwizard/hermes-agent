@@ -57,18 +57,19 @@ def _tool_is_read_only(server_name: str, tool_name: str) -> bool:
 
 
 def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
-    """Approval gate for write-capable tools on ``trust: untrusted`` servers. None to proceed,
+    """Approval gate for ALL tools on ``trust: untrusted`` servers.
+    An untrusted server controls readOnlyHint and can lie about side effects. None to proceed,
     else a ``tool_error``. Fail-closed: approval-system errors block."""
     from tools.mcp_tool_scope import _server_key
     # Trust is the calling profile's own policy (an adopter of a shared connection keeps its own tier).
-    trust = _core._server_trust_levels.get(_server_key(server_name), _core._TRUST_FULL)
-    if trust != _core._TRUST_UNTRUSTED or _tool_is_read_only(server_name, tool_name):
+    trust = _core._server_trust_levels.get(_server_key(server_name), _core._TRUST_UNTRUSTED)
+    if trust != _core._TRUST_UNTRUSTED:
         return None
     try:  # lazy: tools.approval routes the prompt to whichever surface owns the session
         from tools.approval_prompt import request_elicitation_consent
         answer = request_elicitation_consent(
-            f"MCP tool '{tool_name}' on UNTRUSTED server '{server_name}' wants to run. This tool is write-capable "
-            f"(no readOnlyHint=true annotation) and may modify external state.",
+            f"MCP tool '{tool_name}' on UNTRUSTED server '{server_name}' wants to run. This server may mislabel mutating tools as read-only. "
+            f"Approval is required regardless of readOnlyHint.",
             f"Server '{server_name}' is configured 'trust: untrusted'. "
             f"Approve to run '{tool_name}' once, or deny to block it.",
             surface=f"mcp-trust/{server_name}", title=f"MCP server '{server_name}' is asking")
@@ -80,7 +81,7 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
         return None
     logger.info("MCP trust gate: user %s '%s' on untrusted server '%s'",
                 "cancelled" if answer == "cancel" else "denied", tool_name, server_name)
-    return tool_error(f"The user did not approve running write-capable MCP tool '{tool_name}' on untrusted server "
+    return tool_error(f"The user did not approve running untrusted MCP tool '{tool_name}' on untrusted server "
                       f"'{server_name}'. The command was NOT run. Do not retry without explicit user direction.")
 
 
@@ -564,9 +565,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         server, error = _acquire_call_server(server_name, tool_timeout)
         if server is None:
             return error
-        # Only a tool annotated readOnlyHint=True is replayed after session expiry; a 401 is always
-        # pre-dispatch so the auth recoverer keeps its retry for every tool.
-        read_only = _tool_is_read_only(server_name, tool_name)
+        # An UNTRUSTED server can lie about readOnlyHint. Do not automatically
+        # replay a call after session expiry based on untrusted metadata: the
+        # approved call may already have mutated state, and retry could duplicate it.
+        # An explicitly FULL-trusted server may use its read-only hint for safe retry.
+        from tools.mcp_tool_scope import _server_key
+        explicitly_full = (_core._server_trust_levels.get(
+            _server_key(server_name), _core._TRUST_UNTRUSTED) == _core._TRUST_FULL)
+        read_only = explicitly_full and _tool_is_read_only(server_name, tool_name)
 
         async def _call():
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
@@ -596,6 +602,11 @@ def _make_utility_handler(op: str, log_label: str, rpc, render, required: Option
     payload, ``required`` validated before any transport work."""
     def _factory(server_name: str, tool_timeout: float):
         def _handler(args: dict, **kwargs) -> str:
+            # Generated resource/prompt utilities are server RPCs too. An
+            # untrusted server can produce side effects despite a read-like name.
+            error = _trust_gate_check(server_name, op)
+            if error is not None:
+                return error
             from tools import mcp_tool_discovery as _discovery  # lazy: import cycle
             server = _discovery._get_connected_server_for_call(server_name)
             if not server or not server.session:

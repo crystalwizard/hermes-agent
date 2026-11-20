@@ -108,7 +108,7 @@ def clamp_timeout(timeout: Optional[float]) -> Optional[float]:
     if value != value:  # NaN
         logger.warning("clamp_timeout: NaN timeout; treating as unbounded")
         return None
-    return None if value <= 0 else min(value, MAX_SAFE_TIMEOUT_S)
+    return None if value <= 0 else min(value, MAX_SAFE_TIMEOUT_S, max(0.0, threading.TIMEOUT_MAX - 1.0))
 
 
 # --- Timeout resolution: config ``timeouts:`` > legacy env var > default ------
@@ -246,7 +246,7 @@ async def run_bounded_async(
 
     timers = [threading.Timer(timeout_s, lambda: loop.call_soon_threadsafe(_mark_expired))]
     if dump_on_blocked_loop:
-        timers.append(threading.Timer(timeout_s + _LOOP_BLOCKED_DUMP_GRACE_S, _watchdog_check))
+        timers.append(threading.Timer(min(timeout_s + _LOOP_BLOCKED_DUMP_GRACE_S, threading.TIMEOUT_MAX - 0.5), _watchdog_check))
     for t in timers:
         t.daemon = True
         t.start()

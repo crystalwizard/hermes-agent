@@ -51,11 +51,11 @@ def isolated_approvals(monkeypatch):
 
 
 class TestVerdicts:
-    def test_benign_command_allows_with_exit_0(self, isolated_approvals, capsys):
+    def test_benign_command_manual_asks_with_exit_2(self, isolated_approvals, capsys):
         rc = at.approvals_test_command(_args(["ls", "-la"]))
         out = capsys.readouterr().out
-        assert rc == 0
-        assert "allow" in out
+        assert rc == 2
+        assert "ask-approval" in out
 
     def test_hardline_command_denies_with_rule_name(self, isolated_approvals, capsys):
         rc = at.approvals_test_command(_args(["sudo", "re" + "boot"]))
@@ -123,7 +123,7 @@ class TestNormalizationParity:
                                                             capsys):
         rc = at.approvals_test_command(_args(['git', 'st""atus']))
         out = capsys.readouterr().out
-        assert rc == 0
+        assert rc == 2
         assert "git status" in out
 
 
@@ -132,7 +132,7 @@ class TestReadOnly:
         sentinel = tmp_path / "must_not_exist"
         rc = at.approvals_test_command(_args(["touch", str(sentinel)]))
         capsys.readouterr()
-        assert rc == 0
+        assert rc == 2
         assert not sentinel.exists()
 
     def test_dangerous_command_never_prompts_or_persists(self, isolated_approvals,
@@ -165,8 +165,8 @@ class TestOutputAndWiring:
         args.approvals_command = "test"
         rc = approvals_command(args)
         out = capsys.readouterr().out
-        assert rc == 0
-        assert "allow" in out
+        assert rc == 2
+        assert "ask-approval" in out
 
     def test_parser_wires_test_subcommand(self, isolated_approvals, capsys):
         from hermes_cli.subcommands.approvals import build_approvals_parser
@@ -192,6 +192,15 @@ class TestOutputAndWiring:
                                                      capsys):
         rc = at.approvals_test_command(_args(["--", "ls", "-la"]))
         out = capsys.readouterr().out
-        assert rc == 0
+        assert rc == 2
         assert "ls -la" in out
         assert "-- ls" not in out
+
+
+def test_allowlist_dry_run_does_not_start_tirith_install(isolated_approvals):
+    from unittest.mock import patch
+    with patch("tools.approval_floors._command_matches_permanent_allowlist", return_value=True),          patch("tools.approval._tirith_scan", side_effect=AssertionError("scanner must not run")):
+        result = at.evaluate_command("echo approved")
+    assert result["verdict"] == "conditional"
+    assert result["exit_code"] == 2
+    assert "conditional" in result["detail"]

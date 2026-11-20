@@ -21,7 +21,7 @@ EXIT_DENY = 3
 
 _VERDICT_EXIT = {
     "allow": EXIT_ALLOW, "ask-approval": EXIT_ASK, "hardline-deny": EXIT_DENY,
-    "user-deny": EXIT_DENY,
+    "user-deny": EXIT_DENY, "conditional": EXIT_ASK,
 }
 
 
@@ -100,8 +100,13 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
         )
 
     # 6. Permanent command_allowlist.
-    if approval_floors._command_matches_permanent_allowlist(command):
-        return result("allow", detail="matches command_allowlist in config.yaml (permanently approved)")
+    if (approval_context._get_approval_mode() != "smart"
+            and approval_floors._command_matches_permanent_allowlist(command)):
+        return result("conditional", rule="conditional Tirith security check",
+                      detail="matches command_allowlist, but runtime still evaluates Tirith; "
+                             "read-only diagnostic cannot certify its result or an existing "
+                             "session grant without running a possibly installing scanner. "
+                             "This is a conservative conditional verdict, not a definite prompt")
 
     # 7. Dangerous-pattern detection → would prompt.
     is_dangerous, pattern_key, description = approval_detection.detect_dangerous_command(command)
@@ -113,7 +118,14 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
                    f"{pattern_key!r})",
         )
 
-    return result("allow", detail="no guard matched; would run without a prompt")
+    # A pattern miss is not equivalent to execution permission: the live
+    # manual and smart modes gate even commands with no dangerous match.
+    mode = approval_context._get_approval_mode()
+    if mode in ("manual", "smart"):
+        return result("ask-approval", rule=f"{mode} approval mode",
+                      detail="no dangerous pattern matched, but the runtime approval mode "
+                             "requires attended approval or guardian review")
+    return result("allow", detail="no dangerous pattern matched; unattended context policies may still deny execution")
 
 
 def _render_text(verdict: dict) -> None:

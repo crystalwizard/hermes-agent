@@ -558,6 +558,17 @@ def _with_guidance(result: Dict[str, Any], job: Dict[str, Any], deliver: Optiona
     return result
 
 
+def _require_cron_script_approval(paths: list[str]) -> Optional[str]:
+    """Require a human decision before installing or changing scheduled script execution."""
+    if not paths:
+        return None
+    from tools.file_tools_write_guards import _request_protected_instruction_approval
+    return _request_protected_instruction_approval(
+        [str(p) for p in paths if p],
+        subject="scheduled executable script",
+        why_always="Cron may execute these files later without a human present; review each schedule change.")
+
+
 def _action_create(a: Dict[str, Any]) -> str:
     prompt, script = a["prompt"], a["script"]
     deliver = _normalize_deliver_param(a["deliver"])
@@ -592,6 +603,10 @@ def _action_create(a: Dict[str, Any]) -> str:
             [a["context_from"]] if isinstance(a["context_from"], str) else a["context_from"])))
     if error:
         return tool_error(error, success=False)
+    script_targets = [value for value in (script, a["monitor_script"]) if value]
+    approval_error = _require_cron_script_approval(script_targets)
+    if approval_error:
+        return tool_error(approval_error, success=False)
 
     context_from = a["context_from"]
     if a["continuity"] is not None:
@@ -856,6 +871,16 @@ def _action_update(job: Dict[str, Any], a: Dict[str, Any]) -> str:
             return tool_error(error, success=False)
     if not updates:
         return tool_error("No updates provided.", success=False)
+    # Replacing code, enabling no-agent execution, or changing a script
+    # schedule changes the future executable authority of the job.
+    if any(key in updates for key in ("script", "monitor_script", "no_agent", "schedule")):
+        script_targets = [value for value in (
+            updates.get("script", job.get("script")),
+            updates.get("monitor_script", job.get("monitor_script")),
+        ) if value]
+        approval_error = _require_cron_script_approval(script_targets)
+        if approval_error:
+            return tool_error(approval_error, success=False)
     updated = update_job(job["id"], updates)
     _notify_provider_jobs_changed_safe()
     # An update can switch modes or delivery — echo the same guidance as create.

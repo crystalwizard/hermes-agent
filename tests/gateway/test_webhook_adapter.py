@@ -856,7 +856,7 @@ class TestInsecureNoAuthSafetyRail:
 
 
 class TestDualStackBind:
-    """The default bind host must serve BOTH IPv4 and IPv6.
+    """Explicit host='*' must serve BOTH IPv4 and IPv6.
 
     Regression guard for the hosted-agent webhook reachability bug: Fly.io 6PN
     (the private network the edge router reverse-proxies webhook traffic over)
@@ -865,29 +865,33 @@ class TestDualStackBind:
     the router's dial to ``<app>.internal:8644`` hit an address nothing was
     listening on → connection refused → public webhooks unreachable.
 
-    The fix is ``DEFAULT_HOST = None`` (dual-stack). ``"::"`` is NOT a valid
+    Public host='*' intentionally maps to None (dual-stack). ``"::"`` is NOT a valid
     substitute: on hosts with the ``bindv6only`` sysctl set (verified on Fly
     machines) it yields an IPv6-ONLY socket, which would then break the IPv4
     loopback health check and the AF_INET port-conflict probe.
     """
 
 
+    def test_missing_or_blank_host_stays_loopback(self):
+        for extra in ({}, {"host": ""}, {"host": None}):
+            adapter = WebhookAdapter(PlatformConfig(enabled=True, extra=extra))
+            assert adapter._host == "127.0.0.1"
+
     @pytest.mark.asyncio
-    async def test_default_bind_serves_both_families(self):
-        """Binding the real server with the default host opens v4 AND v6 sockets.
+    async def test_explicit_public_bind_serves_both_families(self):
+        """Binding the real server with an explicit '*' opens v4 AND v6 sockets.
 
         This is the behavioural proof: with host=None, asyncio.create_server
         opens a listening socket per resolved family, so both 127.0.0.1 (v4)
         and ::1 (v6) are reachable — exactly what 6PN needs. Uses a real bind
         on an OS-assigned port (no mock) and inspects the runner's addresses.
         """
-        # Build config WITHOUT a host key so the real DEFAULT_HOST (None)
-        # applies — _make_adapter's helper injects host="0.0.0.0" by default,
-        # which would mask the dual-stack default under test here.
+        # Public dual-stack needs explicit opt-in. Missing host is loopback.
         cfg = PlatformConfig(
             enabled=True,
             extra={
                 "port": 0,
+                "host": "*",
                 "routes": {"r1": {"secret": "real-secret-abc123", "prompt": "x"}},
             },
         )

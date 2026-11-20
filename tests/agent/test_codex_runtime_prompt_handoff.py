@@ -5,6 +5,8 @@ codex early-return used to send only cwd + raw user text, so SOUL.md / memory / 
 composed and then silently dropped.
 """
 
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 from agent import codex_runtime
@@ -57,6 +59,52 @@ def test_runtime_omits_prompt_when_agent_has_none(monkeypatch):
     agent._codex_session.ensure_started()
     (_, params), = [(m, p) for (m, p) in client.requests if m == "thread/start"]
     assert "developerInstructions" not in params
+
+
+def test_runtime_routes_codex_server_requests_from_config(monkeypatch):
+    """The config knob must reach the live session rather than existing only in DEFAULT_CONFIG."""
+    created = []
+
+    class _Session:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sess_mod, "CodexAppServerSession", _Session)
+    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(
+        "approvals:\n  codex_server_requests: decline\n",
+        encoding="utf-8",
+    )
+
+    codex_runtime._ensure_codex_session(_agent())
+
+    routing = created[0]["request_routing"]
+    assert routing.ask_server_requests is False
+
+
+def test_invalid_codex_server_request_policy_fails_closed(monkeypatch, caplog):
+    """A typo must not silently turn a deliberate decline policy into prompting."""
+    created = []
+
+    class _Session:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sess_mod, "CodexAppServerSession", _Session)
+    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(
+        "approvals:\n  codex_server_requests: aks\n",
+        encoding="utf-8",
+    )
+
+    codex_runtime._ensure_codex_session(_agent())
+
+    assert created[0]["request_routing"].ask_server_requests is False
+    assert "Invalid approvals.codex_server_requests" in caplog.text
 
 
 def test_runtime_retires_thread_when_prompt_composition_changes(monkeypatch):

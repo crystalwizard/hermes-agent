@@ -19,6 +19,12 @@ from agent import shell_hooks
 # ── helpers ───────────────────────────────────────────────────────────────
 
 
+def _bash_path(path: Path) -> str:
+    """Git Bash script redirections need /f/... rather than Windows F:\..."""
+    text = path.as_posix()
+    return "/" + text[0].lower() + text[2:] if path.drive else text
+
+
 def _write_script(tmp_path: Path, name: str, body: str) -> Path:
     path = tmp_path / name
     path.write_text(body)
@@ -181,7 +187,7 @@ class TestCallbackSubprocess:
         script = _write_script(
             tmp_path, "log.sh",
             f"#!/usr/bin/env bash\n"
-            f"echo \"$(cat -)\" >> {calls}\n"
+            f"echo \"$(cat -)\" >> {_bash_path(calls)}\n"
             f"printf '{{}}\\n'\n",
         )
         spec = shell_hooks.ShellHookSpec(
@@ -201,7 +207,7 @@ class TestCallbackSubprocess:
         capture = tmp_path / "payload.json"
         script = _write_script(
             tmp_path, "capture.sh",
-            f"#!/usr/bin/env bash\ncat - > {capture}\nprintf '{{}}\\n'\n",
+            f"#!/usr/bin/env bash\ncat - > {_bash_path(capture)}\nprintf '{{}}\\n'\n",
         )
         spec = shell_hooks.ShellHookSpec(
             event="pre_tool_call", command=str(script),

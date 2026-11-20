@@ -116,7 +116,7 @@ class TestCronContextVarDetection:
         assert code["approved"] is False
         assert code["outcome"] == "blocked"
 
-    def test_non_cron_blank_context_keeps_headless_execute_code_legacy_approved(self, monkeypatch):
+    def test_blank_cron_context_masks_env_and_headless_follows_ari(self, monkeypatch):
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
@@ -127,6 +127,7 @@ class TestCronContextVarDetection:
 
         tokens = set_session_vars(cron_session="")
         try:
+            assert approval_context._is_cron_approval_context() is False
             result = approval_module.check_execute_code_guard("import os", "local")
         finally:
             clear_session_vars(tokens)
@@ -189,6 +190,11 @@ class TestCronApproveMode:
 # ---------------------------------------------------------------------------
 
 class TestCronDenyModeAllGuards:
+    @pytest.fixture(autouse=True)
+    def _exercise_cron_policy_not_smart_all(self, monkeypatch):
+        """Cron-mode regressions must reach cron logic, not global smart review."""
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+
     """The combined guard function also respects cron_mode."""
 
     def test_dangerous_command_blocked_in_combined_guard(self, monkeypatch):

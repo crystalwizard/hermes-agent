@@ -802,6 +802,363 @@ class TestApprovalPromptEnrichment:
         assert "apply some changes" in captured["command"]
 
 
+class TestCodexServerRequestApprovals:
+    def _run_request(self, method, *, params, callback=None, routing=None):
+        client = FakeClient()
+        scoped_params = {
+            "threadId": "thread-fake-001",
+            "turnId": "turn-fake-001",
+            **params,
+        }
+        client.queue_server_request(method, request_id="approval-1", **scoped_params)
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(
+            client,
+            approval_callback=callback,
+            request_routing=routing,
+        )
+        session.run_turn("hi", turn_timeout=0.2)
+        return client
+
+    def test_permission_request_for_foreign_thread_returns_invalid_params(self):
+        prompted = []
+        client = self._run_request(
+            "item/permissions/requestApproval",
+            params={
+                "threadId": "thread-foreign",
+                "permissions": {"network": {"enabled": True}},
+            },
+            callback=lambda *_a, **_kw: prompted.append(True) or "once",
+        )
+
+        assert prompted == []
+        assert client.responses == []
+        assert client.error_responses == [(
+            "approval-1", -32602, "Server request does not belong to the active thread",
+        )]
+
+    @pytest.mark.parametrize(
+        ("method", "params"),
+        [
+            (
+                "item/permissions/requestApproval",
+                {"turnId": "turn-foreign", "permissions": {"network": {"enabled": True}}},
+            ),
+            (
+                "mcpServer/elicitation/request",
+                {
+                    "threadId": "thread-foreign",
+                    "mode": "form",
+                    "requestedSchema": {"type": "object", "properties": {}},
+                },
+            ),
+        ],
+    )
+    def test_server_request_scope_mismatch_never_prompts(self, method, params):
+        prompted = []
+        client = self._run_request(
+            method,
+            params=params,
+            callback=lambda *_a, **_kw: prompted.append(True) or "once",
+        )
+
+        assert prompted == []
+        assert client.responses == []
+        assert client.error_responses[0][1] == -32602
+
+    def test_permission_requests_follow_human_and_policy_with_valid_protocol_grants(self):
+        requested = {
+            "network": {"enabled": True},
+            "fileSystem": {"write": ["F:/GPT Codex/projects/example"]},
+        }
+        captured = {}
+
+        def approve(command, description, *, allow_permanent=True):
+            captured.update(command=command, description=description,
+                            allow_permanent=allow_permanent)
+            return "once"
+
+        client = self._run_request(
+            "item/permissions/requestApproval",
+            params={"permissions": requested, "cwd": "F:/GPT Codex", "reason": "remove stale output"},
+            callback=approve,
+        )
+
+        assert client.responses == [("approval-1", {
+            "permissions": requested,
+            "scope": "turn",
+        })]
+        assert "remove stale output" in captured["description"]
+        assert "network" in captured["command"] and "fileSystem" in captured["command"]
+        assert captured["allow_permanent"] is True
+
+        denied = self._run_request(
+            "item/permissions/requestApproval",
+            params={"permissions": {"network": {"enabled": True}}, "reason": "download dependency"},
+            callback=lambda *_a, **_kw: "deny",
+        )
+        assert denied.responses == [("approval-1", {
+            "permissions": {},
+            "scope": "turn",
+        })]
+
+        unattended = self._run_request(
+            "item/permissions/requestApproval",
+            params={"permissions": {"network": {"enabled": True}}},
+        )
+        assert unattended.responses == [("approval-1", {
+            "permissions": {},
+            "scope": "turn",
+        })]
+
+        def must_not_prompt(*_a, **_kw):
+            raise AssertionError("decline policy must not invoke the approval callback")
+
+        policy_decline = self._run_request(
+            "item/permissions/requestApproval",
+            params={"permissions": {"network": {"enabled": True}}},
+            callback=must_not_prompt,
+            routing=_ServerRequestRouting(ask_server_requests=False),
+        )
+        assert policy_decline.responses == [("approval-1", {
+            "permissions": {},
+            "scope": "turn",
+        })]
+
+    def test_empty_permission_request_declines_without_prompting(self):
+        client = self._run_request(
+            "item/permissions/requestApproval",
+            params={"permissions": {}},
+            callback=lambda *_a, **_kw: pytest.fail("empty permission request prompted"),
+        )
+
+        assert client.responses == [("approval-1", {
+            "permissions": {},
+            "scope": "turn",
+        })]
+
+    def test_legacy_exec_auto_approve_does_not_grant_permission_requests(self):
+        prompted = []
+        client = self._run_request(
+            "item/permissions/requestApproval",
+            params={"permissions": {"network": {"enabled": True}}},
+            callback=lambda *_a, **_kw: prompted.append(True) or "deny",
+            routing=_ServerRequestRouting(auto_approve_exec=True),
+        )
+
+        assert prompted == [True]
+        assert client.responses == [("approval-1", {
+            "permissions": {},
+            "scope": "turn",
+        })]
+
+    def test_permission_always_choice_is_remembered_by_exact_profile(self, monkeypatch):
+        import tools.approval as approval
+
+        remembered = []
+        monkeypatch.setattr(approval, "is_approved", lambda *_args: False)
+        monkeypatch.setattr(
+            approval, "approve_session",
+            lambda session_key, rule_key: remembered.append(("session", session_key, rule_key)),
+        )
+        monkeypatch.setattr(
+            approval, "approve_permanent",
+            lambda rule_key: remembered.append(("permanent", rule_key)),
+        )
+        monkeypatch.setattr(
+            approval, "save_permanent_allowlist",
+            lambda patterns: remembered.append(("saved", patterns)),
+        )
+        requested = {"network": {"enabled": True}}
+        client = self._run_request(
+            "item/permissions/requestApproval",
+            params={"permissions": requested},
+            callback=lambda *_a, **_kw: "always",
+        )
+
+        assert client.responses == [("approval-1", {
+            "permissions": requested,
+            "scope": "session",
+        })]
+        rule_keys = [entry[-1] for entry in remembered if entry[0] in {"session", "permanent"}]
+        assert len(set(rule_keys)) == 1
+        assert rule_keys[0].startswith("codex_permission:")
+        assert any(entry[0] == "saved" and rule_keys[0] in entry[1] for entry in remembered)
+
+    def test_remembered_permission_profile_does_not_prompt_again(self, monkeypatch):
+        import tools.approval as approval
+
+        checked = []
+        monkeypatch.setattr(
+            approval, "is_approved",
+            lambda session_key, rule_key: checked.append((session_key, rule_key)) or True,
+        )
+        requested = {"fileSystem": {"read": ["F:/GPT Codex"]}}
+        client = self._run_request(
+            "item/permissions/requestApproval",
+            params={"permissions": requested},
+            callback=lambda *_a, **_kw: pytest.fail("remembered approval prompted again"),
+        )
+
+        assert checked and checked[0][1].startswith("codex_permission:")
+        assert client.responses == [("approval-1", {
+            "permissions": requested,
+            "scope": "session",
+        })]
+
+    def test_empty_schema_mcp_confirmation_asks_instead_of_auto_declining(self):
+        seen = []
+        client = self._run_request(
+            "mcpServer/elicitation/request",
+            params={
+                "serverName": "calendar-tools",
+                "mode": "form",
+                "message": "Allow calendar access?",
+                "requestedSchema": {"type": "object", "properties": {}},
+            },
+            callback=lambda command, description, **_kw: seen.append((command, description)) or "once",
+        )
+
+        assert client.responses == [("approval-1", {
+            "action": "accept",
+            "content": {},
+            "_meta": None,
+        })]
+        assert "calendar-tools" in seen[0][0]
+        assert "Allow calendar access?" in seen[0][1]
+
+    def test_unanswered_mcp_confirmation_is_cancel_not_user_decline(self):
+        client = self._run_request(
+            "mcpServer/elicitation/request",
+            params={
+                "serverName": "calendar-tools",
+                "mode": "form",
+                "message": "Allow calendar access?",
+                "requestedSchema": {"type": "object", "properties": {}},
+            },
+            callback=lambda *_a, **_kw: "timeout",
+        )
+
+        assert client.responses == [("approval-1", {
+            "action": "cancel",
+            "content": None,
+            "_meta": None,
+        })]
+
+    def test_broken_mcp_approval_surface_is_cancel_not_user_decline(self):
+        def broken_callback(*_args, **_kwargs):
+            raise RuntimeError("approval surface disconnected")
+
+        client = self._run_request(
+            "mcpServer/elicitation/request",
+            params={
+                "serverName": "calendar-tools",
+                "mode": "form",
+                "message": "Allow calendar access?",
+                "requestedSchema": {"type": "object", "properties": {}},
+            },
+            callback=broken_callback,
+        )
+
+        assert client.responses == [("approval-1", {
+            "action": "cancel",
+            "content": None,
+            "_meta": None,
+        })]
+
+    def test_decline_policy_applies_to_hermes_tools_elicitations(self):
+        prompted = []
+        client = self._run_request(
+            "mcpServer/elicitation/request",
+            params={
+                "serverName": "hermes-tools",
+                "mode": "form",
+                "message": "Confirm Hermes action",
+                "requestedSchema": {"type": "object", "properties": {}},
+            },
+            callback=lambda *_a, **_kw: prompted.append(True) or "once",
+            routing=_ServerRequestRouting(ask_server_requests=False),
+        )
+
+        assert prompted == []
+        assert client.responses == [("approval-1", {
+            "action": "decline",
+            "content": None,
+            "_meta": None,
+        })]
+
+    def test_structured_mcp_form_declines_without_binary_approval_prompt(self):
+        prompted = []
+
+        def must_not_prompt(*_args, **_kwargs):
+            prompted.append(True)
+            return "once"
+
+        client = self._run_request(
+            "mcpServer/elicitation/request",
+            params={
+                "serverName": "calendar-tools",
+                "mode": "form",
+                "message": "Choose a calendar",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {"calendar": {"type": "string"}},
+                    "required": ["calendar"],
+                },
+            },
+            callback=must_not_prompt,
+        )
+
+        assert client.responses == [("approval-1", {
+            "action": "decline",
+            "content": None,
+            "_meta": None,
+        })]
+        assert prompted == []
+
+    def test_url_mcp_elicitation_declines_until_secure_browser_flow_exists(self):
+        prompted = []
+        client = self._run_request(
+            "mcpServer/elicitation/request",
+            params={
+                "serverName": "calendar-tools",
+                "mode": "url",
+                "message": "Authorize account",
+                "url": "https://example.test/authorize",
+                "elicitationId": "auth-1",
+            },
+            callback=lambda *_args, **_kwargs: prompted.append(True) or "once",
+        )
+
+        assert client.responses == [("approval-1", {
+            "action": "decline",
+            "content": None,
+            "_meta": None,
+        })]
+        assert prompted == []
+
+    def test_unknown_mcp_elicitation_mode_returns_invalid_params(self):
+        prompted = []
+        client = self._run_request(
+            "mcpServer/elicitation/request",
+            params={
+                "serverName": "calendar-tools",
+                "mode": "future-mode",
+                "message": "Unknown interaction",
+            },
+            callback=lambda *_args, **_kwargs: prompted.append(True) or "once",
+        )
+
+        assert client.responses == []
+        assert client.error_responses == [(
+            "approval-1", -32602, "Unsupported MCP elicitation mode: future-mode",
+        )]
+        assert prompted == []
+
+
 # ---- openclaw beta.8 parity: retire/wedge/oauth/abort marker ----
 
 class TestSessionRetirement:

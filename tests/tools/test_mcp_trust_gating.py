@@ -1,18 +1,14 @@
 """Tests for MCP tool trust-tier gating via readOnlyHint annotations.
 
-Security boundary under test: write-capable MCP tools (anything whose
-``readOnlyHint`` annotation is not exactly ``True``) on servers configured
-``trust: untrusted`` must route through the existing dangerous-approval
-path before the RPC fires. Read-only tools and tools on trusted servers
-pass straight through.
+Security boundary under test: ALL MCP tools on servers configured
+``trust: untrusted`` require approval before the RPC. The server controls
+its own readOnlyHint metadata, which is not proof that a call has no side effects.
+Only explicitly trusted servers bypass per-tool approval.
 
 Adversarial notes encoded in these tests:
-- ``readOnlyHint`` is a HINT supplied by the (potentially hostile) server.
-  It can only ever RELAX gating on a server the operator already marked
-  untrusted; the trust tier itself is operator-side config, so a lying
-  server can at worst skip approval for a tool it claims is read-only —
-  which is why the trust key is per-server and gating is fail-closed for
-  missing/unknown metadata.
+- ``readOnlyHint`` is an UNTRUSTED HINT supplied by a potentially hostile server.
+  It must never relax the operator-side trust tier or bypass an owner approval.
+  Missing/unknown metadata never grants permissions.
 - Missing annotations ⇒ write-capable (fail closed).
 - Unknown/garbage ``trust`` values ⇒ treated as untrusted (fail closed).
 """
@@ -118,24 +114,23 @@ class TestTrustGateAtCallTime:
         fake_session.call_tool.assert_not_awaited()
         assert "error" in json.loads(raw)
 
-    def test_read_only_tool_on_untrusted_server_skips_approval(
+    def test_forged_read_only_hint_on_untrusted_server_does_not_bypass_approval(
         self, fake_session
     ):
-        """readOnlyHint=True tools pass without consulting approval."""
+        """The server's readOnlyHint=True cannot authorize a hidden write."""
         _set_trust("srv", "untrusted")
         _set_read_only("srv", "list_repos", True)
         handler = _mcp_handlers._make_tool_handler("srv", "list_repos", 30.0)
-        with patch(
-            "tools.approval_prompt.request_elicitation_consent"
-        ) as consent:
+        with patch("tools.approval_prompt.request_elicitation_consent", return_value="decline") as consent:
             raw = handler({})
-        consent.assert_not_called()
-        assert json.loads(raw) == {"result": "ok"}
+        consent.assert_called_once()
+        fake_session.call_tool.assert_not_awaited()
+        assert "error" in json.loads(raw)
 
     def test_trusted_server_skips_approval_for_write_tools(
         self, fake_session
     ):
-        """trust: full (and the default) never consults approval."""
+        """Explicit trust: full skips consent for write-capable tools."""
         _set_trust("srv", "full")
         handler = _mcp_handlers._make_tool_handler("srv", "delete_repo", 30.0)
         with patch(
@@ -145,15 +140,16 @@ class TestTrustGateAtCallTime:
         consent.assert_not_called()
         assert json.loads(raw) == {"result": "ok"}
 
-    def test_unconfigured_server_defaults_to_full_trust(self, fake_session):
-        """Backward compat: servers with no trust key behave as before."""
+    def test_unconfigured_server_defaults_to_untrusted_consent(self, fake_session):
+        """Missing trust must fail closed for write-capable tools."""
         handler = _mcp_handlers._make_tool_handler("srv", "delete_repo", 30.0)
         with patch(
-            "tools.approval_prompt.request_elicitation_consent"
+            "tools.approval_prompt.request_elicitation_consent", return_value="decline"
         ) as consent:
             raw = handler({"repo": "x"})
-        consent.assert_not_called()
-        assert json.loads(raw) == {"result": "ok"}
+        consent.assert_called_once()
+        fake_session.call_tool.assert_not_awaited()
+        assert "error" in json.loads(raw)
 
     def test_read_only_false_hint_is_gated(self, fake_session):
         """An explicit readOnlyHint=False is write-capable."""
@@ -276,8 +272,8 @@ class TestTrustNormalization:
         assert _mcp_registration._normalize_server_trust("full") == "full"
         assert _mcp_registration._normalize_server_trust("UNTRUSTED") == "untrusted"
         assert _mcp_registration._normalize_server_trust("  Full ") == "full"
-        # Missing key → default full (backward compatible; documented).
-        assert _mcp_registration._normalize_server_trust(None) == "full"
+        # Missing trust must not silently grant full access.
+        assert _mcp_registration._normalize_server_trust(None) == "untrusted"
 
 
 class TestAnnotationCaptureAtDiscovery:
@@ -332,3 +328,46 @@ class TestAnnotationCaptureAtDiscovery:
         assert _mcp_registration._annotation_read_only_hint(
             SimpleNamespace()
         ) is False
+
+
+@pytest.mark.parametrize("trust,side_effects", [("untrusted", True), ("full", False)])
+def test_server_readonly_claim_cannot_make_untrusted_retry_safe(trust, side_effects):
+    """A forged read-only hint cannot replay an already-performed mutation after expiry."""
+    _set_trust("srv", trust)
+    _set_read_only("srv", "could_mutate", True)
+    with patch.object(_mcp_handlers, "_trust_gate_check", return_value=None):
+        with patch.object(_mcp_handlers, "_acquire_call_server", return_value=(object(), None)):
+            with patch.object(_mcp_handlers, "_dispatch", return_value="SENT") as dispatch:
+                handler = _mcp_handlers._make_tool_handler("srv", "could_mutate", 15)
+                assert handler({}) == "SENT"
+    retry_handlers = dispatch.call_args.args[5]
+    expiry_handler = retry_handlers[2]
+    assert expiry_handler.keywords["call_may_have_side_effects"] is side_effects
+
+
+def test_untrusted_generated_mcp_utility_requires_consent_before_discovery():
+    """Resource/prompt utilities must not sidestep trust via a separate RPC handler."""
+    utility_factory = _mcp_handlers._make_utility_handler(
+        "resources/list", "list_resources", lambda *_: None, lambda *_: {})
+    handler = utility_factory("srv", 12)
+    with (patch.dict(mcp_tool._server_trust_levels, {"srv": "untrusted"}, clear=True),
+          patch("tools.approval_prompt.request_elicitation_consent", return_value="decline") as consent,
+          patch("tools.mcp_tool_discovery._get_connected_server_for_call") as acquire):
+        result = handler({})
+        assert "error" in json.loads(result)
+        consent.assert_called_once()
+        acquire.assert_not_called()
+
+
+def test_explicit_full_trust_allows_generated_mcp_utility_dispatch():
+    utility_factory = _mcp_handlers._make_utility_handler(
+        "resources/list", "list_resources", lambda *_: None, lambda *_: {})
+    handler = utility_factory("srv", 12)
+    connected = SimpleNamespace(session=object(), _rpc_lock=None)
+    with (patch.dict(mcp_tool._server_trust_levels, {"srv": "full"}, clear=True),
+          patch("tools.approval_prompt.request_elicitation_consent") as consent,
+          patch("tools.mcp_tool_discovery._get_connected_server_for_call", return_value=connected),
+          patch.object(_mcp_handlers, "_dispatch", return_value="SENT") as dispatch):
+        assert handler({}) == "SENT"
+        consent.assert_not_called()
+        dispatch.assert_called_once()

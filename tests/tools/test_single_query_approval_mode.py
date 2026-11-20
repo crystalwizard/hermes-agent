@@ -167,6 +167,10 @@ class TestSingleQueryApproveMode:
 # ---------------------------------------------------------------------------
 
 class TestSingleQueryDenyModeAllGuards:
+    @pytest.fixture(autouse=True)
+    def _exercise_specific_context_policy(self, monkeypatch):
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+
     """The combined guard function also respects single_query_mode."""
 
     def test_dangerous_command_blocked_in_combined_guard(self, monkeypatch):
@@ -241,6 +245,10 @@ class TestSingleQueryDenyModeAllGuards:
 # ---------------------------------------------------------------------------
 
 class TestSingleQueryExecuteCode:
+    @pytest.fixture(autouse=True)
+    def _exercise_specific_context_policy(self, monkeypatch):
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+
     """execute_code auto-approves in plain non-gateway mode. A -q run must not
     silently auto-approve arbitrary code — it goes through single_query_mode."""
 
@@ -270,9 +278,9 @@ class TestSingleQueryExecuteCode:
             result = approval_module.check_execute_code_guard("import os", "local")
             assert result["approved"]
 
-    def test_headless_execute_code_still_auto_approves_outside_single_query(self, monkeypatch):
-        """Without the single-query marker, headless execute_code keeps its
-        documented auto-approve contract (no behavior change outside -q)."""
+    def test_headless_execute_code_outside_single_query_approves(self, monkeypatch):
+        """Outside single-query, ordinary manual unattended approval is denied;
+        the single-query marker must not bypass this security policy."""
         monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)

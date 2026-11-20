@@ -511,6 +511,26 @@ def _timestamp_line(agent: Any) -> str:
     return timestamp_line + "".join(f"\n{label}: {value}" for label, value in trailer if value)
 
 
+def _pending_proposals_part(agent: Any) -> List[str]:
+    """One line, built once at session start, when writes are waiting for the user's approval, so they are never
+    forgotten unseen. Only when the tool that acts on them is exposed (never advertise a gated-off tool)."""
+    try:
+        if "pending_proposals" not in (getattr(agent, "valid_tool_names", None) or ()):
+            return []
+        from tools import write_approval as _wa
+        records = [r for sub in (_wa.SKILLS, _wa.MEMORY) for r in _wa.list_pending(sub)]
+        if not records:
+            return []
+        import time as _time
+        oldest = _time.strftime("%Y-%m-%d", _time.localtime(min(r.get("created_at", 0) for r in records)))
+        auto = sum(1 for r in records if r.get("origin") == "background_review")
+        return [f"Pending proposals: {len(records)} write(s) are waiting for the user's approval (oldest {oldest}; "
+                f"{auto} came from your own background review). Use the pending_proposals tool to list, read, reject "
+                "(with a reason) or ask_approval; approving is the user's decision, not yours."]
+    except Exception:
+        return []
+
+
 def _memory_parts(agent: Any) -> List[str]:
     """Built-in memory/USER.md blocks plus the external provider block (gated on
     the same check ``inject_memory_provider_tools`` uses, so we never advertise
@@ -536,6 +556,7 @@ def _memory_parts(agent: Any) -> List[str]:
                 _ext_mem_block = None
             if _ext_mem_block:
                 parts.append(_ext_mem_block)
+    parts.extend(_pending_proposals_part(agent))
     return parts
 
 

@@ -1288,7 +1288,7 @@ DEFAULT_CONFIG = {
         # Approval gate for memory writes on BOTH foreground turns and the background review fork.
         # true = foreground writes prompt inline; background writes are staged (/memory
         # pending|approve <id>|reject <id>). To disable memory: memory_enabled.
-        "write_approval": False,
+        "write_approval": True,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # Periodic built-in memory review; 0 when an external provider auto-extracts.
@@ -1452,7 +1452,7 @@ DEFAULT_CONFIG = {
         # Approval gate for skill_manage mutations on BOTH foreground turns and the background
         # review fork. true = ALWAYS stage (SKILL.md too large for an inline prompt): /skills
         # pending, /skills diff <id>, /skills approve|reject <id>.
-        "write_approval": False,
+        "write_approval": True,
         # Audit ledger: every skill mutation appends to ~/.hermes/skills/.curator_ledger.jsonl with
         # before/after hashes (blobs under ~/.hermes/.curator_backups/blobs/); powers `hermes
         # curator ledger` / `rollback <entry-id>`. Never a gate — failures can't block.
@@ -1654,6 +1654,11 @@ DEFAULT_CONFIG = {
         "cron_mode": "deny",
         "single_query_mode": "deny",
         "unattended_mode": "deny",
+        # Codex app-server can ask for broader filesystem/network permissions or relay an MCP
+        # elicitation. "ask" routes supported requests through Hermes' approval surface when one
+        # exists; unattended/no-callback sessions, structured forms, and URL flows still fail closed.
+        # "decline" never presents these request families to the user.
+        "codex_server_requests": "ask",
         # Extra rules appended to the smart-approval guardian's SYSTEM prompt, e.g. "Always ESCALATE
         # commands touching /etc".
         "smart_policy": "",
@@ -2175,7 +2180,7 @@ DEFAULT_CONFIG = {
         # files must be under the Hermes cache, media_delivery_allow_dirs, or fresher than
         # trust_recent_files_seconds — recommended for public-facing gateways so prompt injection
         # can't exfiltrate host secrets. Bridged to HERMES_MEDIA_DELIVERY_STRICT.
-        "strict": False,
+        "strict": True,
         # Extra roots (project/scratch dirs, mounted shares) from which bare file paths may be
         # uploaded; the Hermes cache is always trusted. List of absolute paths or one
         # os.pathsep-separated string; tildes expanded. Bridged to HERMES_MEDIA_ALLOW_DIRS. Honored

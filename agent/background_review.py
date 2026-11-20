@@ -665,7 +665,13 @@ def _action_lines(data: Dict, detail: Dict, verbose: bool) -> List[str]:
     if data.get("staged"):
         # The fork's own review summary is never published back, so an unattended-review
         # consolidation proposal must surface here or it is silently lost (#105921).
-        return [data["message"]] if data.get("proposal_staged") and data.get("message") else []
+        if data.get("proposal_staged") and data.get("message"):
+            return [data["message"]]
+        # A write the approval gate staged: say so, with its id, or it sits unseen until someone happens to look.
+        if data.get("pending_id"):
+            what = str(data.get("gist") or data.get("message") or "a change")[:140]
+            return [f"proposal {data['pending_id']} waiting for approval: {what}"]
+        return []
     message = data.get("message", "")
     target = data.get("target", "") or detail.get("target", "")
     is_skill = detail.get("tool") == "skill_manage"
@@ -1083,6 +1089,7 @@ def _review_tool_whitelist(
     memory_on = review_agent._memory_enabled or review_agent._user_profile_enabled
     review_toolsets = ["memory", "skills"] if memory_on and review_memory else ["skills"]
     whitelist = {t["function"]["name"] for t in get_tool_definitions(enabled_toolsets=review_toolsets, quiet_mode=True)}
+    whitelist.discard("pending_proposals")  # the review makes proposals; it never sees or settles the pending list
     # Read-only file tools: denying read_file/search_files caused a per-review denial storm that
     # starved the loop (read_file also registers the read with the read-before-write guard).
     # Write tools stay denied — autonomous maintenance goes through skill_manage's validation.

@@ -86,3 +86,12 @@ def test_splatted_kwargs_helper_counts_only_when_it_sets_stdin():
     assert len(guard.find_subprocess_calls(unsafe_const, "x.py")) == 1
     assert len(guard.find_subprocess_calls(undefined, "x.py")) == 1
     assert [v["line"] for v in guard.find_subprocess_calls(unrelated_later, "x.py")] == [3]
+
+
+def test_known_safe_path_lookup_uses_portable_separators():
+    from pathlib import PureWindowsPath
+    guard = _load_guard()
+    root = PureWindowsPath("C:/repo")
+    path = PureWindowsPath("C:/repo/plugins/security-guidance/patterns.py")
+    assert guard._repo_relative_posix(path, root) == "plugins/security-guidance/patterns.py"
+    assert guard._repo_relative_posix(path, root) in guard.KNOWN_SAFE

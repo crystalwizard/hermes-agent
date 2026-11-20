@@ -784,8 +784,9 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
             # (#112548). A withdrawal, not a deny: nobody refused the command.
             if request_id:
                 _approval.withdraw_gateway_approval(session_key, request_id,
-                                                    "the attached client cannot answer approval requests "
-                                                    "(update the Hermes app)")
+                                                    "the approval prompt was closed without an answer: the user sent "
+                                                    "a new message or stopped the turn, or the attached app cannot "
+                                                    "show approval prompts")
             return
         choice = str(result.get("choice") or "deny")
         _approval.resolve_gateway_approval(session_key, choice, resolve_all=bool(result.get("all")),

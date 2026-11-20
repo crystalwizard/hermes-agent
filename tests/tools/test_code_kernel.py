@@ -48,7 +48,9 @@ def _kernel_config(**overrides):
     """Pin code_execution config; strict mode keeps the test hermetic."""
     config = {"mode": "strict", "kernel_mode": "session", "timeout": 30}
     config.update(overrides)
-    with patch("tools.code_execution_tool._load_config", return_value=config):
+    with patch("tools.code_execution_tool._load_config", return_value=config),          patch("tools.approval.check_execute_code_guard", return_value={"approved": True}):
+        # Kernel lifecycle/RPC tests model a previously authorized cell;
+        # guardian policy itself is tested separately.
         yield
 
 
@@ -385,11 +387,23 @@ class TestKernelOwnershipAndLifecycle(unittest.TestCase):
                 t.join()
         self.assertEqual([r["status"] for r in results], ["success"] * 6)
         self.assertEqual(len(_KERNELS), 1)
-        live = subprocess.run(
-            ["pgrep", "-fc", "-P", str(os.getpid()), "hermes_kernel_runner"],
-            capture_output=True, text=True,
-        ).stdout.strip()
-        self.assertEqual(live, "1")
+        if os.name == "nt":
+            import psutil
+            descendants = psutil.Process(os.getpid()).children(recursive=True)
+            live = [child for child in descendants if child.is_running()
+                    and "hermes_kernel_runner" in " ".join(child.cmdline())]
+            runner_pids = {child.pid for child in live}
+            # Windows venv launchers produce a wrapper and a Python child,
+            # both bearing the same runner command line. Count runner roots.
+            roots = [child for child in live
+                     if child.ppid() not in runner_pids]
+            self.assertEqual(len(roots), 1)
+        else:
+            live = subprocess.run(
+                ["pgrep", "-fc", "-P", str(os.getpid()), "hermes_kernel_runner"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            self.assertEqual(live, "1")
 
 
 class TestPerCellRpcAuthority(unittest.TestCase):

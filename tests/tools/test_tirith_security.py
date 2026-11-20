@@ -15,11 +15,13 @@ from tools.tirith_security import check_command_security, ensure_installed
 
 
 @pytest.fixture(autouse=True)
-def _reset_resolved_path():
+def _reset_resolved_path(request, monkeypatch):
     """Pre-set cached path to skip auto-install in scan tests.
     Tests that specifically test ensure_installed / resolve behavior
     reset this to None themselves.
     """
+    if request.cls is not TestUnsupportedPlatform:
+        monkeypatch.setattr(_tirith_mod, "is_platform_supported", lambda: True)
     _tirith_mod._resolved_path = "tirith"
     _tirith_mod._install_thread = None
     _tirith_mod._install_failure_reason = ""
@@ -329,6 +331,16 @@ class TestUnsupportedPlatform:
             assert result == {"action": "allow", "findings": [], "summary": ""}
             mock_run.assert_not_called()
             mock_resolve.assert_not_called()
+
+    def test_windows_unmocked_unsupported_scanner_fails_closed(self, monkeypatch):
+        import platform
+        if platform.system() != "Windows":
+            pytest.skip("Windows-only")
+        monkeypatch.setenv("TIRITH_ENABLED", "1")
+        monkeypatch.setenv("TIRITH_FAIL_OPEN", "0")
+        verdict = check_command_security("echo harmless")
+        assert verdict["action"] == "block", verdict
+        assert "unavailable" in verdict["summary"]
 
     @patch("tools.tirith_security._load_security_config")
     def test_explicit_path_still_honored_on_unsupported_platform(self, mock_cfg):
@@ -771,6 +783,10 @@ class TestEmojiVariationSelectorSuppression:
 # ---------------------------------------------------------------------------
 
 class TestMkdtempOSErrorNoSpace:
+    @pytest.fixture(autouse=True)
+    def _simulate_supported_installer(self, monkeypatch):
+        monkeypatch.setattr(_tirith_mod, "_detect_target", lambda: "x86_64-unknown-linux-gnu")
+
     """When tempfile.mkdtemp raises OSError (e.g. disk full), _install_tirith
     must return (None, "no_space") instead of propagating the exception.
     This prevents the unbounded retry + temp-dir leak described in #51826.
@@ -796,3 +812,14 @@ class TestMkdtempOSErrorNoSpace:
             _install_tirith(log_failures=False)
         after = set(glob.glob("/tmp/tirith-install-*"))
         assert after - before == set()
+
+
+def test_supported_platform_open_circuit_respects_fail_closed(monkeypatch):
+    import time
+    monkeypatch.setattr(_tirith_mod, "is_platform_supported", lambda: True)
+    monkeypatch.setattr(_tirith_mod, "_circuit_open", True)
+    monkeypatch.setattr(_tirith_mod, "_circuit_open_at", time.monotonic())
+    monkeypatch.setattr(_tirith_mod, "_load_security_config", lambda: {
+        "tirith_enabled": True, "tirith_fail_open": False,
+        "tirith_path": "tirith", "tirith_timeout": 5})
+    assert check_command_security("echo hello")["action"] == "block"

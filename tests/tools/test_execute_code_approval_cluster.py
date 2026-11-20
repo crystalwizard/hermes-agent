@@ -157,8 +157,8 @@ def test_guard_isolated_backend_approved():
     assert A.check_execute_code_guard("import os", "docker")["approved"] is True
 
 
-def test_guard_headless_local_approved(monkeypatch):
-    # Documented #30882 limitation: no approval surface → preserve auto-run.
+def test_guard_headless_manual_local_approves_with_no_context(monkeypatch):
+    # Manual mode with no approval surface must deny host code.
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
@@ -196,6 +196,7 @@ def test_guard_explicit_non_cron_masks_leaked_env(monkeypatch):
     finally:
         clear_session_vars(tokens)
         reset_session_vars()
+    # Cron context is cleared and no unattended policy remains: Ari parity allows.
     assert res["approved"] is True
 
 
@@ -220,15 +221,15 @@ def test_guard_gateway_user_approves_is_one_shot(gw_session):
     assert A.is_approved(gw_session, "execute_code") is False
 
 
-def test_guard_session_approval_short_circuits_prompt(gw_session):
-    """Once session-approved, execute_code skips the approval prompt (#39275)."""
+def test_guard_prior_generic_session_grant_cannot_approve_new_script(gw_session):
+    """A generic old session grant must not authorize a different script."""
     # Manually set session approval.
     A.approve_session(gw_session, "execute_code")
     try:
-        # Even with a denier registered, the is_approved check short-circuits.
+        # The new per-script consent re-prompts, and this denier must prevail.
         _register_resolver(gw_session, "deny")
         res = A.check_execute_code_guard("import os", "local")
-        assert res["approved"] is True
+        assert res["approved"] is False
     finally:
         with A._lock:
             s = A._session_approved.get(gw_session, set())
@@ -323,7 +324,7 @@ def test_execute_code_smart_deny_owner_override_is_one_operation(gw_session, mon
     assert changed["outcome"] == "denied"
 
 
-def test_smart_escalate_still_persists_session_choice(gw_session, monkeypatch):
+def test_smart_escalate_requires_per_command_consent(gw_session, monkeypatch):
     """The DENY restriction must not alter Smart ESCALATE's manual choices."""
     key = "smart-escalate-persistence"
     with A._lock:
@@ -348,9 +349,9 @@ def test_smart_escalate_still_persists_session_choice(gw_session, monkeypatch):
     result = A.check_all_command_guards("dangerous escalate", "local")
 
     assert result["approved"] is True
-    assert shown["approval_data"]["allow_permanent"] is True
+    assert shown["approval_data"]["allow_permanent"] is False
     assert "smart_denied" not in shown["approval_data"]
-    assert A.is_approved(gw_session, key) is True
+    assert A.is_approved(gw_session, key) is False
 
 
 def test_terminal_smart_deny_pending_payload_is_one_operation(gw_session, monkeypatch):

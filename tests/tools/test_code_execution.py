@@ -690,7 +690,9 @@ class TestHeadTailTruncation(unittest.TestCase):
     """Tests for head+tail truncation of large stdout in execute_code."""
 
     def _run(self, code):
-        with patch("model_tools.handle_function_call", side_effect=_mock_handle_function_call):
+        # Output truncation tests operate on an already-authorized code cell.
+        # Keep approval-policy assertions in their dedicated test suite.
+        with patch("model_tools.handle_function_call", side_effect=_mock_handle_function_call),              patch("tools.approval.check_execute_code_guard", return_value={"approved": True}):
             result = execute_code(
                 code=code,
                 task_id="test-task",
@@ -759,7 +761,7 @@ class TestRpcTokenAuthorization(unittest.TestCase):
     """
 
     def _drive_server(self, rpc_token, requests):
-        """Run _rpc_server_loop against a real AF_UNIX socketpair.
+        """Run _rpc_server_loop against a real connected socketpair.
 
         Sends each dict in *requests* as a newline-delimited JSON message
         and returns the list of decoded JSON responses.
@@ -768,7 +770,7 @@ class TestRpcTokenAuthorization(unittest.TestCase):
 
         # socketpair gives us a connected client end and a "server" end we
         # can hand to accept() by wrapping it in a tiny listener shim.
-        srv, cli = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv, cli = socket.socketpair()
 
         class _OneShotListener:
             """Minimal object exposing the .accept()/.settimeout() the loop uses."""

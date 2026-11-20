@@ -38,6 +38,7 @@ def container_env(tmp_path, monkeypatch):
     return hermes_home
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows never uses container mode; see test_ari_container_mode_windows_guard.py")
 def test_get_container_exec_info_returns_metadata(container_env):
     """Reads .container-mode and returns all fields including exec_user."""
     with patch("hermes_constants.is_container", return_value=False):

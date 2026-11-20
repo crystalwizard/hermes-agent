@@ -133,19 +133,19 @@ class TestExecuteCodeGuardCliApprovalSurvivesExecAskLeak:
         assert result.get("approved") is False
         assert result.get("outcome") == "timeout"
 
-    def test_cli_callback_session_choice_persists_approval(self, monkeypatch):
+    def test_cli_callback_session_choice_does_not_approve_other_scripts(self, monkeypatch):
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         set_approval_callback(lambda command, description, **kwargs: "session")
 
         first = check_execute_code_guard("print('hi')", "local")
         assert first.get("approved") is True
 
-        # A second call in the same session must short-circuit on the
-        # session-approval cache without prompting again.
+        # Whole-script consent cannot authorize a different script, even in
+        # the same session and after an earlier session choice.
         set_approval_callback(None)
         second = check_execute_code_guard("print('again')", "local")
-        assert second.get("approved") is True
-        assert second.get("status") != "pending_approval"
+        assert second.get("approved") is False
+        assert second.get("status") == "pending_approval"
 
     def test_pending_approval_still_used_without_cli_callback(self, monkeypatch):
         """Headless ask-mode without a CLI callback keeps the pending fallback."""
@@ -234,6 +234,13 @@ class TestGatewayRunImportDoesNotSetExecAsk:
 import os, sys
 os.environ.pop("HERMES_EXEC_ASK", None)
 sys.path.insert(0, %r)
+# Stand-in Python may lack installed runtime dependencies; use Reed's own venv
+# site-packages without mutating the subprocess environment or installation.
+from pathlib import Path
+repo = Path(sys.path[0])
+venv_site = repo / "venv" / "Lib" / "site-packages"
+if venv_site.is_dir():
+    sys.path.append(str(venv_site))
 # Avoid starting the gateway; only import the module for _gateway_runner_ref
 # style side imports.
 import gateway.run  # noqa: F401

@@ -102,6 +102,18 @@ def _validate_batch_ops(operations, default_name, tool_error):
         # op[1] would first apply op[0] and then roll the whole batch back.
         if (shape_err := _op_shape_error(act, op)) is not None:
             return fail(i, f" ({act} on '{nm}'): {shape_err}")
+        # Reject a bad name (and a bad new-skill body) BEFORE the gate stages the batch, so a broken write is
+        # refused immediately instead of staged and failing at approve time (create takes a bare name; the
+        # other actions also accept ``category/name``, as the single-op path does).
+        from tools.skill_manager_tool import (
+            _validate_category, _validate_content_size, _validate_frontmatter, _validate_name)
+        if (name_err := _validate_name(nm if act == "create" else Path(nm).name)) is not None:
+            return fail(i, f" ({act} on '{nm}'): {name_err}")
+        if act == "create" and (create_err := (
+                _validate_category(op.get("category"))
+                or _validate_frontmatter(op.get("content") or "", new_skill=True)
+                or _validate_content_size(op.get("content") or ""))) is not None:
+            return fail(i, f" (create on '{nm}'): {create_err}")
         names.append(nm)
         if act == "create" and nm in names[:-1]:
             return fail(i, f": create for '{nm}' must precede that skill's other ops.")

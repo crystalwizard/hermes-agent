@@ -5,6 +5,7 @@ handling without requiring a running terminal environment.
 """
 
 import json
+import os
 import logging
 from unittest.mock import MagicMock, patch
 
@@ -178,14 +179,15 @@ class TestPatchSensitivePathExtraction:
     @patch("tools.file_tools._get_file_ops")
     def test_patch_move_to_sensitive_dst_blocked(self, mock_get):
         from tools.file_tools import patch_tool
+        target = "C:/Windows/System32/drivers/etc/hosts" if os.name == "nt" else "/etc/crontab"
         patch_text = (
             "*** Begin Patch\n"
-            "*** Move File: /tmp/work.txt -> /etc/crontab\n"
+            f"*** Move File: /tmp/work.txt -> {target}\n"
             "*** End Patch\n"
         )
         result = json.loads(patch_tool(mode="patch", patch=patch_text))
         assert "error" in result
-        assert "sensitive" in result["error"].lower()
+        assert ("blocked" if os.name == "nt" else "sensitive") in result["error"].lower()
         mock_get.assert_not_called()
 
 
@@ -198,9 +200,10 @@ class TestPatchSensitivePathExtraction:
         is bypassed.
         """
         from tools.file_tools import patch_tool
+        target = "C:/Windows/System32/drivers/etc/hosts" if os.name == "nt" else "/etc/resolv.conf"
         patch_text = (
             "*** Begin Patch\n"
-            "***Update File: /etc/resolv.conf\n"
+            f"***Update File: {target}\n"
             "@@ @@\n"
             "-old\n"
             "+new\n"
@@ -208,7 +211,7 @@ class TestPatchSensitivePathExtraction:
         )
         result = json.loads(patch_tool(mode="patch", patch=patch_text))
         assert "error" in result
-        assert "sensitive" in result["error"].lower()
+        assert ("blocked" if os.name == "nt" else "sensitive") in result["error"].lower()
         mock_get.assert_not_called()
 
 
@@ -292,7 +295,7 @@ class TestPatchHints:
     """Patch tool should hint when old_string is not found."""
 
     @patch("tools.file_tools._get_file_ops")
-    def test_no_match_includes_hint(self, mock_get):
+    def test_no_match_includes_hint(self, mock_get, tmp_path):
         mock_ops = MagicMock()
         result_obj = MagicMock()
         result_obj.to_dict.return_value = {
@@ -302,13 +305,13 @@ class TestPatchHints:
         mock_get.return_value = mock_ops
 
         from tools.file_tools import patch_tool
-        raw = patch_tool(mode="replace", path="foo.py", old_string="x", new_string="y")
+        raw = patch_tool(mode="replace", path=str(tmp_path / "foo.py"), old_string="x", new_string="y")
         # patch_tool surfaces the hint as a structured "_hint" field on the
         # JSON error payload (not an inline "[Hint: ..." tail).
         assert json.loads(raw).get("_hint")
 
     @patch("tools.file_tools._get_file_ops")
-    def test_success_no_hint(self, mock_get):
+    def test_success_no_hint(self, mock_get, tmp_path):
         mock_ops = MagicMock()
         result_obj = MagicMock()
         result_obj.to_dict.return_value = {"success": True, "diff": "--- a\n+++ b"}
@@ -316,8 +319,9 @@ class TestPatchHints:
         mock_get.return_value = mock_ops
 
         from tools.file_tools import patch_tool
-        raw = patch_tool(mode="replace", path="foo.py", old_string="x", new_string="y")
-        assert "_hint" not in raw
+        raw = patch_tool(mode="replace", path=str(tmp_path / "foo.py"), old_string="x", new_string="y")
+        assert json.loads(raw).get("success") is True
+        assert "_hint" not in json.loads(raw)
 
 
 class TestSearchHints:
@@ -375,8 +379,10 @@ class TestSensitivePathCheck:
         from tools.file_tools import write_file_tool
         result = json.loads(write_file_tool("/etc/passwd", "evil"))
         assert "error" in result
-        assert "sensitive system path" in result["error"]
+        assert any(term in result["error"].lower() for term in
+                   ("sensitive system path", "protected system/credential file"))
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX/macOS absolute-path semantics, not Windows paths")
     def test_macos_private_var_carveouts(self):
         """macOS temp dirs under /private/var must not be blanket-blocked,
         while the genuinely-sensitive /private/var subtrees still are."""
@@ -590,6 +596,31 @@ class TestSilentFileMisplacementE2E:
             "file silently misplaced into config default (the #26211 bug)"
 
         tt.clear_session_cwd(task_id)
+
+
+class TestFileVersionDescriptorPortability:
+    def test_stable_file_has_digest_even_when_descriptor_ctime_differs(self, tmp_path):
+        from tools.file_tools_read_tracking import _file_version
+        import hashlib
+        p = tmp_path / "stable.txt"
+        p.write_bytes(b"first content")
+        version = _file_version(str(p))
+        assert version is not None, "stable regular files must have a dedup/read-baseline version"
+        assert version[-1] == hashlib.sha256(b"first content").digest()
+
+    def test_same_size_and_restored_mtime_still_changes_digest(self, tmp_path):
+        from tools.file_tools_read_tracking import _file_version
+        import os
+        p = tmp_path / "stable.txt"
+        p.write_bytes(b"first")
+        first = _file_version(str(p))
+        assert first is not None
+        st = p.stat()
+        p.write_bytes(b"other")
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
+        second = _file_version(str(p))
+        assert second is not None
+        assert first[-1] != second[-1], "a preserved timestamp must not conceal changed bytes"
 
 
 class TestDedupInvalidationTaskResolution:
@@ -984,3 +1015,22 @@ class TestConflictMarkerFlag:
         prose.write_text("print('<<<<<<< not a conflict')\n", encoding="utf-8")
         assert "conflict_blocks" not in json.loads(read_file_tool(str(prose)))
 
+
+
+def test_real_read_dedup_detects_same_size_restored_mtime_edit(tmp_path):
+    """Regression F6: a changed file must never receive the unchanged-content stub."""
+    import json
+    import os
+    from uuid import uuid4
+    from tools.file_tools import read_file_tool
+    path = tmp_path / "f6-dedup.txt"
+    path.write_text("first" + chr(10), encoding="utf8")
+    task = "f6-" + uuid4().hex
+    first = json.loads(read_file_tool(str(path), task_id=task))
+    assert "first" in first.get("content", ""), first
+    original = path.stat()
+    path.write_text("other" + chr(10), encoding="utf8")
+    os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+    reread = json.loads(read_file_tool(str(path), task_id=task))
+    assert "other" in reread.get("content", ""), reread
+    assert not reread.get("dedup"), reread

@@ -18,6 +18,7 @@ during a retry backoff) must still SIGINT the command (exit 130); non-approved
 commands keep current interrupt behavior.
 """
 import json
+import os
 import threading
 import time
 
@@ -43,6 +44,13 @@ def _isolate(tmp_path, monkeypatch):
     yield
     with _lock:
         _interrupted_threads.clear()
+
+
+def _shell_path(path):
+    """Use MSYS drive notation for the POSIX shell under Windows test runs."""
+    if os.name == "nt":
+        return "/" + path.drive[0].lower() + path.as_posix()[2:]
+    return str(path)
 
 
 def _wait_for_sentinel(sentinel, timeout=10.0):
@@ -93,14 +101,14 @@ def test_approved_command_genuine_interrupt_after_start_still_kills(tmp_path):
 
     def worker():
         holder["result"] = tt.terminal_tool(
-            command=f"touch {sentinel}; sleep 5; echo DONE", force=True
+            command=f"touch {_shell_path(sentinel)}; sleep 5; echo DONE", force=True
         )
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
     # Barrier: the command is genuinely running (so the clear already ran) before
     # we fire the interrupt -- no fixed-sleep timing guess.
-    assert _wait_for_sentinel(sentinel), "command did not start"
+    assert _wait_for_sentinel(sentinel), f"command did not start; holder={holder!r}; sentinel={sentinel!s}"
     set_interrupt(True, thread_id=t.ident)  # genuine interrupt, AFTER start
     t.join(timeout=15)
     assert not t.is_alive(), "worker did not exit after a genuine interrupt"
@@ -124,11 +132,11 @@ def test_approved_note_enriched_not_misleading_on_interrupt(monkeypatch, tmp_pat
     holder = {}
 
     def worker():
-        holder["result"] = tt.terminal_tool(command=f"touch {sentinel}; sleep 5; echo DONE")
+        holder["result"] = tt.terminal_tool(command=f"touch {_shell_path(sentinel)}; sleep 5; echo DONE")
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
-    assert _wait_for_sentinel(sentinel), "command did not start"
+    assert _wait_for_sentinel(sentinel), f"command did not start; holder={holder!r}; sentinel={sentinel!s}"
     set_interrupt(True, thread_id=t.ident)
     t.join(timeout=15)
     assert not t.is_alive()

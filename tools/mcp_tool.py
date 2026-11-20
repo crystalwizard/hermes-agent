@@ -472,14 +472,11 @@ _server_breaker_opened_at: Dict[Any, float] = {}
 _server_errors_all_application: Dict[Any, bool] = {}
 _CIRCUIT_BREAKER_THRESHOLD, _CIRCUIT_BREAKER_COOLDOWN_SEC = 3, 60.0
 
-# Trust-tier gating (``trust: full | untrusted``): on an untrusted server every write-capable
-# call (discovery-time ``readOnlyHint`` not exactly True; malformed fails closed) needs approval
-# before the RPC fires. A lying readOnlyHint can only skip approval for calls the operator was
-# already warned about, never widen access. Missing trust = full; unrecognized = untrusted (a
-# typo must never disable the gate). Classified at CALL time from DISCOVERY data: no schema
-# mutation, prompt cache intact. ``_server_trust_levels`` is keyed by the CONSUMING profile's own
-# key (its policy for the name, even when it adopted another profile's connection);
-# ``_tool_read_only_hints`` by the connection key (the server's own tool annotations).
+# Trust-tier gating (``trust: full | untrusted``): an untrusted server
+# must obtain fresh consent for EVERY tool call. Discovery readOnlyHint is
+# server-supplied and cannot certify that a call has no side effects.
+# Missing or unknown trust = untrusted, explicit full alone skips consent.
+# Trust applies per consuming profile; hints are retained as advisory metadata.
 _server_trust_levels: Dict[Any, str] = {}
 _tool_read_only_hints: Dict[Any, Dict[str, bool]] = {}
 

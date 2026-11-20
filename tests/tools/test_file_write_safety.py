@@ -232,22 +232,27 @@ class TestSafeRootDenialMessageIntegration:
 class TestCheckSensitivePathMacOSBypass:
     """Verify _check_sensitive_path blocks /private/etc paths (issue #8734)."""
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX-only protected root path")
     def test_etc_hosts_blocked(self):
         from tools.file_tools_write_guards import _check_sensitive_path
         assert _check_sensitive_path("/etc/hosts") is not None
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX-only protected root path")
     def test_private_etc_hosts_blocked(self):
         from tools.file_tools_write_guards import _check_sensitive_path
         assert _check_sensitive_path("/private/etc/hosts") is not None
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX-only protected root path")
     def test_private_etc_ssh_config_blocked(self):
         from tools.file_tools_write_guards import _check_sensitive_path
         assert _check_sensitive_path("/private/etc/ssh/sshd_config") is not None
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX-only protected root path")
     def test_private_var_blocked(self):
         from tools.file_tools_write_guards import _check_sensitive_path
         assert _check_sensitive_path("/private/var/db/something") is not None
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX-only protected root path")
     def test_boot_still_blocked(self):
         from tools.file_tools_write_guards import _check_sensitive_path
         assert _check_sensitive_path("/boot/grub/grub.cfg") is not None
@@ -298,7 +303,8 @@ class TestAtomicWrite:
         res = ops.patch_replace(str(target), "b = 2", "b = 22")
         assert res.success, res.error
         assert target.read_text(encoding="utf-8") == "a = 1\nb = 22\nc = 3\n"
-        assert (os.stat(target).st_mode & 0o777) == 0o600
+        if os.name != "nt":
+            assert (os.stat(target).st_mode & 0o777) == 0o600
 
 
 class TestBomHandling:
@@ -497,7 +503,10 @@ class TestProtectedInstructionFiles:
         real = tmp_path / "AGENTS.md"
         real.write_text("original", encoding="utf-8")
         link = tmp_path / "innocent.txt"
-        link.symlink_to(real)
+        try:
+            link.symlink_to(real)
+        except OSError as exc:
+            pytest.skip(f"host filesystem cannot create symlink: {exc}")
         approvals["answer"] = "deny"
         res = self._write(link, "injected")
         assert res.get("error") and "BLOCKED" in res["error"]
@@ -831,4 +840,4 @@ class TestMultiplexProfileWriteGuardsAreProfileScoped:
         finally:
             reset_hermes_home_override(tok)
         assert err is not None
-        assert "Refusing to write to Hermes config file" in err
+        assert "BLOCKED:" in err and "config.yaml" in err

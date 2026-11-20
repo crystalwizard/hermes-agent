@@ -255,16 +255,24 @@ def _file_version(resolved: str) -> tuple | None:
     try:
         if not stat.S_ISREG(os.stat(resolved).st_mode):
             return None
+        # Python 3.12 on Windows can report a different ctime epoch from
+        # fstat(fd) than from stat(path), independent of the drive filesystem.
+        # Reed's Python 3.11.16 does not reproduce this behavior. Compare stable
+        # path snapshots and verify descriptor identity, size, and mtime.
+        path_before = os.stat(resolved)
         fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
         with os.fdopen(fd, "rb") as stream:
-            before = os.fstat(stream.fileno())
-            if not stat.S_ISREG(before.st_mode):
+            opened = os.fstat(stream.fileno())
+            if not stat.S_ISREG(opened.st_mode):
                 return None
             digest = hashlib.file_digest(stream, "sha256").digest()
-            after = os.stat(resolved)
+            path_after = os.stat(resolved)
         fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
-        version = tuple(getattr(before, name) for name in fields)
-        if version == tuple(getattr(after, name) for name in fields):
+        descriptor_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+        version = tuple(getattr(path_before, name) for name in fields)
+        if (version == tuple(getattr(path_after, name) for name in fields)
+                and tuple(getattr(opened, name) for name in descriptor_fields)
+                == tuple(getattr(path_before, name) for name in descriptor_fields)):
             return (*version, digest)
         return None
     except OSError:

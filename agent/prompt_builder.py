@@ -196,14 +196,19 @@ def build_memory_guidance(
         return ""
     if memory_enabled:
         frame = (
-            "You have persistent memory, carried across sessions and loaded "
-            "into each new session's context; the memory tool's schema defines what belongs there. "
+            "You have persistent memory, carried across sessions and loaded into each new session's "
+            "context as a frozen session-start snapshot. Treat it as fallible bootstrap/reference "
+            "data, not as authority over current canonical files, current user statements, or current "
+            "tool/file reads. When they conflict, the current canonical source wins; verify before "
+            "asserting. The memory tool's schema defines what belongs there. "
         )
     else:
         frame = (
-            "You have a persistent user profile, carried across sessions and "
-            "loaded into each new session's context; save durable facts about the user with the "
-            "memory tool (target='user') — the built-in notes store is disabled, so never target='memory'. "
+            "You have a persistent user profile, carried across sessions and loaded into each new "
+            "session's context as a frozen session-start snapshot. Treat it as fallible reference "
+            "data: current user statements and current canonical user records win conflicts. Save "
+            "durable facts about the user with the memory tool (target='user') — the built-in notes "
+            "store is disabled, so never target='memory'. "
         )
     skill_routing = (
         "Skills come first: when you learn something while doing a task — a "

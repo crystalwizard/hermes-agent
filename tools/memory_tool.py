@@ -74,6 +74,9 @@ def _gate_or_stage(summary: str, detail: str, payload: Dict[str, Any]) -> Option
     if decision.blocked:
         return tool_error(decision.message, success=False)
     record = wa.stage_write(wa.MEMORY, payload, summary=f"{summary}: {detail[:120]}", origin=wa.current_origin())
+    if record["id"] == "unstaged":
+        return tool_error("Could not stage this change for approval (the pending store is full or not writable). "
+                          "Nothing was written or queued; try again.", success=False)
     return json.dumps({"success": True, "staged": True, "pending_id": record["id"], "message": decision.message},
                       ensure_ascii=False)
 
@@ -162,6 +165,8 @@ def _background_delete_gate(action, operations, target="memory", content=None, o
             summary=(f"background review consolidation ({'batch' if operations is not None else action} "
                      f"on {target}): {detail}")[:200],
             origin=wa.current_origin())
+        if record["id"] == "unstaged":
+            raise RuntimeError("pending store did not accept the proposal")  # fail closed to the denial below
         return json.dumps({
             "success": True, "staged": True, "proposal_staged": True, "pending_id": record["id"],
             "message": ("Background review may not delete memory entries unattended. The proposed "
