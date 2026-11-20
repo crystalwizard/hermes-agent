@@ -625,6 +625,9 @@ def _run_write_gate(build_staging):
         return tool_error(decision.message, success=False)
     payload, gist = build_staging(wa)
     record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
+    if record["id"] == "unstaged":
+        return tool_error("Could not stage this change for approval (the pending store is full or not writable). "
+                          "Nothing was written or queued; try again.", success=False)
     return json.dumps({"success": True, "staged": True, "pending_id": record["id"],
                        "gist": gist, "message": decision.message}, ensure_ascii=False)
 
@@ -776,14 +779,16 @@ def skill_manage(
     args = dict(content=content, category=category, file_path=file_path, file_content=file_content,
                 old_string=old_string, new_string=new_string, replace_all=replace_all,
                 absorbed_into=absorbed_into)
-    if (gate_result := _apply_skill_write_gate(action, name, **args)) is not None:
-        return gate_result
+    # Reject a broken write BEFORE the gate stages it (as the memory tool does), so it is never staged only to
+    # fail at approve time and linger in the pending list.
     if (shape_err := _op_shape_error(action, args)) is not None:
         return tool_error(shape_err, success=False)
     # Validate before the lock is keyed on the name, so a rejected name never touches .locks/
     # (create takes a bare name; the other actions also accept ``category/name``).
     if (name_err := _validate_name(name if action == "create" or not name else Path(name).name)) is not None:
         return json.dumps(_err(name_err), ensure_ascii=False)
+    if (gate_result := _apply_skill_write_gate(action, name, **args)) is not None:
+        return gate_result
     # A mutation is read-modify-write even when its action eventually delegates
     # to a helper: guards, ledger capture, patch matching, validation, rollback,
     # and the atomic replacement all belong to the same ownership window.

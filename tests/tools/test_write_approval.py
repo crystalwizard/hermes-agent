@@ -61,10 +61,12 @@ def test_normalize_enabled_coerces_values():
     assert wa._normalize_enabled("on") is True
     assert wa._normalize_enabled("approve") is True
     assert wa._normalize_enabled("true") is True
-    # Everything else → False (gate off is the safe default).
+    # Only the explicit off words turn the gate off; anything else fails closed (gate on).
     assert wa._normalize_enabled("off") is False
-    assert wa._normalize_enabled("garbage") is False
-    assert wa._normalize_enabled(None) is False
+    assert wa._normalize_enabled("false") is False
+    assert wa._normalize_enabled("disabled") is False
+    assert wa._normalize_enabled("garbage") is True
+    assert wa._normalize_enabled(None) is True
 
 
 # ---------------------------------------------------------------------------
@@ -72,9 +74,10 @@ def test_normalize_enabled_coerces_values():
 # ---------------------------------------------------------------------------
 
 def test_memory_gate_off_allows_write(hermes_home):
-    # Default (gate off) → write straight through, no staging.
+    # The gate is ON by default now, so turn it off explicitly → write straight through, no staging.
     from tools.memory_tool import memory_tool, MemoryStore
     from tools import write_approval as wa
+    _set_approval("memory", False)
     store = MemoryStore(); store.load_from_disk()
     r = json.loads(memory_tool("add", "user", "save me", store=store))
     assert r["success"] is True

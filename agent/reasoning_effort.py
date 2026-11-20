@@ -37,6 +37,13 @@ CODEX_ASTRA_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 ASTRA_MODEL_IDS: frozenset[str] = frozenset({"gpt-6-astra", "gpt-6-astra-900k"})
 #: GPT-6 Sol/Terra/Luna (the 5.6 successors; ``-pro``/``-900k``/dated snapshots share the prefix).
 GPT6_TIER_PREFIXES: tuple[str, ...] = ("gpt-6-sol", "gpt-6-luna")
+#: GPT-6 point-release families whose effort vocabulary is VERIFIED. ``gpt-6.1-sol`` live-verified 2026-10-13:
+#: the endpoint 400s on ``none`` ("Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'"), so
+#: this slug must NOT fall through to the legacy set, which advertises ``none`` and lacks ``max``. Add a
+#: family here only after its vocabulary is checked against the endpoint; an unknown future point release
+#: (gpt-6.2-*, ...) deliberately does not inherit this rule.
+GPT6_POINT_NO_NONE_PREFIXES: tuple[str, ...] = ("gpt-6.1-sol",)
+CODEX_GPT6_POINT_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 DAYBREAK_MODEL_IDS: frozenset[str] = frozenset(
     {"gpt-daybreak-blue-latest", "gpt-daybreak-blue-latest-900k"}
 )
@@ -99,6 +106,8 @@ def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     if is_astra_model(model):
         return CODEX_ASTRA_EFFORTS
     bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+    if bare.startswith(GPT6_POINT_NO_NONE_PREFIXES):
+        return CODEX_GPT6_POINT_EFFORTS
     return (
         CODEX_GPT56_EFFORTS
         if "gpt-5.6" in bare or bare.startswith(GPT6_TIER_PREFIXES) or bare in DAYBREAK_MODEL_IDS

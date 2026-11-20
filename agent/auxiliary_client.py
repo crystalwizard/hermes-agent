@@ -1519,6 +1519,17 @@ class _CodexCompletionsAdapter:
                     resp_kwargs["include"] = ["reasoning.encrypted_content"]
                 elif "none" in supported and not is_xai:
                     resp_kwargs["reasoning"] = {"effort": "none"}
+                elif supported and reasoning_cfg.get("enabled") is False and not is_xai:
+                    # This model's vocabulary has no ``none`` (gpt-6.1-sol, Astra): omitting the field would
+                    # hand the effort back to the model default (often medium or higher), the opposite of what
+                    # a thinking-off caller asked for. Step UP to the floor, same policy as
+                    # agent/auxiliary_reasoning_floor.py, instead of waiting for a 400 or paying default effort.
+                    # Clamp the floor to THIS route's vocabulary: a profile-declared route may lack ``low`` too,
+                    # and a literal ``low`` there would be a new invalid wire value.
+                    from agent.auxiliary_reasoning_floor import REASONING_FLOOR_EFFORT
+                    floor = clamp_effort(REASONING_FLOOR_EFFORT, supported)
+                    if floor in supported:
+                        resp_kwargs["reasoning"] = {"effort": floor}
         if wire_tools:
             resp_kwargs["tools"] = wire_tools
         if wire_aliases:

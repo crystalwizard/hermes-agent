@@ -8,6 +8,7 @@ gate in :mod:`tools.approval`.
 import contextvars
 import logging
 import os
+import threading
 from hermes_cli.config import cfg_get
 from utils import env_var_enabled, is_truthy_value
 
@@ -239,19 +240,29 @@ def _get_approval_mode() -> str:
 def _get_approval_timeout() -> int:
     """Read ``approvals.timeout`` (default 300s: gateway push notifications may
     not be seen for minutes; 60s failed closed before Telegram taps landed).
-    Clamped to ``agent.deadline.MAX_SAFE_TIMEOUT_S`` (~1 year): a larger value
-    overflows ``time_t`` inside ``Thread.join`` / ``Lock.acquire`` on macOS and
-    crashed every parallel tool batch; clamping at the single config-read site
-    keeps every consumer platform-safe at once."""
+    Clamped to both ``agent.deadline.MAX_SAFE_TIMEOUT_S`` and the platform's
+    ``threading.TIMEOUT_MAX`` less 61 seconds for the downstream human-wait
+    margin. The generic one-year bound still overflows Windows' DWORD-based
+    timed locks; the platform-aware limit protects all downstream consumers."""
     try:
         raw = int(_get_approval_config().get("timeout", 300))
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
+        # YAML may parse .inf/- .inf as floats. int(infinity) raises
+        # OverflowError before any platform-safe timeout clamp runs.
+        return 300
+    if raw < 0:
+        # Python Lock.acquire(timeout=-1) waits forever, while join(-1)
+        # returns immediately. Negative config must not split the policy.
+        logger.warning("approvals.timeout=%s is negative; using 300s default", raw)
         return 300
     try:
         from agent.deadline import MAX_SAFE_TIMEOUT_S
         safe_cap = int(MAX_SAFE_TIMEOUT_S)
     except Exception:
-        safe_cap = 365 * 24 * 3600  # fail CLOSED: the raw value would re-open the overflow
+        safe_cap = 365 * 24 * 3600  # never allow the unbounded raw value
+    # Windows Lock.acquire uses a DWORD millisecond wait and overflows near
+    # 49.7 days. Leave headroom for the human-wait/gate 60-second margin.
+    safe_cap = min(safe_cap, max(0, int(threading.TIMEOUT_MAX - 61)))
     if raw > safe_cap:
         logger.warning("approvals.timeout=%s exceeds the platform-safe maximum; clamping to %ss", raw, safe_cap)
     return min(raw, safe_cap)

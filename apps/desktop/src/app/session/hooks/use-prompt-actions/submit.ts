@@ -161,7 +161,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         return (
           [contextRefs, terminalContextBlocks, visibleText].filter(Boolean).join('\n\n') ||
-          (present.some(a => a.kind === 'image') ? 'What do you see in this image?' : '')
+          (present.some(a => a.kind === 'image') ? 'Take a look at this image' : '')
         )
       }
 

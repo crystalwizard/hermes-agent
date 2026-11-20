@@ -46,9 +46,9 @@ def write_approval_enabled(subsystem: str) -> bool:
         return False
     try:
         from hermes_cli.config import load_config, cfg_get
-        return _normalize_enabled(cfg_get(load_config(), subsystem, CONFIG_KEY, default=False))
+        return _normalize_enabled(cfg_get(load_config(), subsystem, CONFIG_KEY, default=True))
     except Exception:
-        return False
+        return True  # Config lookup failure must not bypass approval.
 
 
 def _normalize_enabled(value: Any) -> bool:
@@ -56,12 +56,19 @@ def _normalize_enabled(value: Any) -> bool:
     covers hand-edited configs (YAML already parses bare on/off/yes/no)."""
     if isinstance(value, bool):
         return value
-    return isinstance(value, str) and value.strip().lower() in _TRUTHY_STRINGS
+    if isinstance(value, str):
+        return value.strip().lower() not in {"off", "false", "no", "0", "disabled"}
+    return True  # Unexpected type fails closed.
 
 
 # --- Pending store (file-backed) ---
 
 def _pending_path(subsystem: str, pending_id: str) -> Path:
+    if subsystem not in _SUBSYSTEMS:
+        raise ValueError("invalid pending subsystem")
+    # The empty ID is used internally only to locate the pending directory.
+    if pending_id and not re.fullmatch(r"[0-9a-f]{8}", pending_id):
+        raise ValueError("invalid pending ID")
     return get_hermes_home() / "pending" / subsystem / f"{pending_id}.json"
 
 
@@ -70,12 +77,35 @@ def _pending_files(subsystem: str) -> list:
     return list(d.glob("*.json")) if d.exists() else []
 
 
+def _claim_pending_id(subsystem: str) -> str:
+    """Reserve an unused 8-hex pending ID by exclusively creating its file (atomic: two writers can never
+    hold the same ID, and an existing pending record is never overwritten). Returns ``"unstaged"`` when no
+    free ID is found in 32 draws or the directory cannot be written; that is not a valid pending ID, so
+    the caller's write fails safely (logged, nothing committed)."""
+    for _ in range(32):
+        cand = uuid.uuid4().hex[:8]
+        try:
+            path = _pending_path(subsystem, cand)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("x"):
+                pass
+        except FileExistsError:
+            continue
+        except Exception as e:  # pragma: no cover - disk failure path
+            logger.error("Could not claim a pending %s ID: %s", subsystem, e, exc_info=True)
+            return "unstaged"
+        return cand
+    logger.error("No free pending %s ID after 32 draws; write not staged", subsystem)
+    return "unstaged"
+
+
 def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin: str) -> Dict[str, Any]:
     """Persist a pending write and return its record (``id`` + metadata). ``payload`` is the exact
     kwargs to replay the write on approval; ``origin`` is ``foreground`` or ``background_review``.
-    Best-effort: on disk failure it logs and still returns a record — the write is lost, which is
-    the safe failure for an approval gate (nothing silently committed)."""
-    pid = uuid.uuid4().hex[:8]
+    Best-effort: on any failure it logs and returns a record whose ``id`` is ``"unstaged"`` — the write is
+    lost, which is the safe failure for an approval gate (nothing silently committed). Callers must treat
+    ``"unstaged"`` as NOT staged and tell the agent so."""
+    pid = _claim_pending_id(subsystem)
     record = {
         "id": pid, "subsystem": subsystem, "action": payload.get("action", ""),
         "summary": (summary or "").strip(), "origin": origin or "foreground",
@@ -85,6 +115,9 @@ def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin
         atomic_json_write(_pending_path(subsystem, pid), record)
     except Exception as e:  # pragma: no cover - disk failure path
         logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
+        with suppress(Exception):  # drop the empty claim file so no stray ID is left behind
+            _pending_path(subsystem, pid).unlink()
+        record["id"] = "unstaged"  # one signal for every failure: callers must not report it as staged
     return record
 
 
@@ -105,7 +138,12 @@ def list_pending(subsystem: str) -> List[Dict[str, Any]]:
 
 def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
     """Return a single pending record by id, or None."""
-    path = _pending_path(subsystem, pending_id)
+    if not pending_id:  # the empty ID only locates the directory; it is never a record
+        return None
+    try:
+        path = _pending_path(subsystem, pending_id)
+    except ValueError:
+        return None
     if not path.exists():
         return None
     with suppress(Exception):
@@ -116,14 +154,43 @@ def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
 
 def discard_pending(subsystem: str, pending_id: str) -> bool:
     """Delete a pending record. Returns True if it existed."""
+    if not pending_id:  # never delete by the empty ID
+        return False
     try:
         path = _pending_path(subsystem, pending_id)
         if path.exists():
             path.unlink()
+            with suppress(Exception):  # the agent's approval request (sidecar) goes with the record
+                _ask_path(subsystem, pending_id).unlink()
             return True
     except Exception as e:  # pragma: no cover
         logger.error("Failed to discard pending %s/%s: %s", subsystem, pending_id, e)
     return False
+
+
+def _ask_path(subsystem: str, pending_id: str) -> Path:
+    return _pending_path(subsystem, pending_id).with_suffix(".ask")  # <id>.ask: not matched by the *.json record glob
+
+
+def set_approval_request(subsystem: str, rec: Dict[str, Any], note: str) -> bool:
+    """Record that the agent asks the user to approve ``rec``, in a sidecar file, NEVER by rewriting the staged record:
+    a rewrite after a concurrent approve/reject would recreate the record that was just removed. False if it is already gone."""
+    if not _pending_path(subsystem, rec["id"]).exists():
+        return False
+    atomic_json_write(_ask_path(subsystem, rec["id"]),
+                      {"at": time.time(), "note": note, "record_created_at": rec.get("created_at")})
+    return True
+
+
+def get_approval_request(subsystem: str, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The agent's approval request for ``rec``, or None. A sidecar left by an earlier record with the same ID is ignored."""
+    try:
+        data = json.loads(_ask_path(subsystem, rec["id"]).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if isinstance(data, dict) and data.get("record_created_at") == rec.get("created_at"):
+        return data
+    return None
 
 
 def pending_count(subsystem: str) -> int:

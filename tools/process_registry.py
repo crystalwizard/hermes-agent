@@ -2604,6 +2604,44 @@ def _handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dic
 _MAX_HANDOFFS_PER_CHILD = 3
 
 
+def _gate_process_input(session_id: str, action: str, data: str) -> str | None:
+    """Require complete, fresh, one-operation approval for process stdin."""
+    if action == "write" and data == "":
+        return None
+    if len(data) > 2000:
+        return "BLOCKED: process input exceeds 2000 characters; nothing was sent."
+    # Escape/history controls can replay commands not visible to the approver.
+    if any((ord(ch) < 32 and ch not in "\n\r\x03\x04") or ord(ch) == 127 for ch in data):
+        return "BLOCKED: process input contains unsafe control characters."
+    session = process_registry.get(session_id)
+    if session is None:
+        return None
+    try:
+        from agent.redact import redact_sensitive_text
+        shown = redact_sensitive_text(data, force=True)
+    except Exception:
+        return "BLOCKED: cannot display process input safely for approval."
+    if shown != data:
+        return "BLOCKED: redaction would hide executable process input."
+    shown = "".join((chr(92) + "u" + format(ord(ch), "04x")) if not ch.isprintable() else ch for ch in shown)
+    shown = shown.replace("{", chr(92) + "u007b").replace("}", chr(92) + "u007d")
+    # A short Unicode/control input can expand into a much larger approval
+    # description. Never submit an expanded payload beyond the display budget.
+    if len(shown) > 2000:
+        return "BLOCKED: escaped process input exceeds 2000 visible characters; nothing was sent."
+    raw_cmd = str(getattr(session, "command", "unknown") or "unknown")
+    cmd = "".join(ch if ch.isprintable() and ch not in "{}"
+                  else chr(92) + "u" + format(ord(ch), "04x") for ch in raw_cmd)
+    if len(cmd) > 160:
+        import hashlib
+        fingerprint = hashlib.sha256(raw_cmd.encode("utf-8", errors="surrogatepass")).hexdigest()
+        cmd = cmd[:160] + " ... [command shortened; full SHA-256 " + fingerprint + "]"
+    from tools.file_tools_write_guards import _request_protected_instruction_approval
+    return _request_protected_instruction_approval(
+        [f"process {session_id} ({cmd}) {action}: {shown}"], session_id, subject="running process stdin",
+        why_always="Text may execute code; each input needs separate approval.")
+
+
 def _handle_process(args, **kw):
     action = args.get("action", "")
     # Coerce to string — some models send session_id as an integer
@@ -2617,6 +2655,10 @@ def _handle_process(args, **kw):
     if action in _SESSION_ACTIONS:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
+        if action in ("write", "submit"):
+            blocked = _gate_process_input(session_id, action, str(args.get("data", "")))
+            if blocked:
+                return tool_error(blocked)
         handler, redact = _SESSION_ACTIONS[action]
         result = handler(session_id, args)
         return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)

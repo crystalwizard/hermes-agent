@@ -23,6 +23,9 @@ def _fmt_pending_list(subsystem: str) -> str:
         origin = r.get("origin", "foreground")
         tag = " [auto]" if origin == "background_review" else ""
         lines.append(f"  {r['id']}{tag}  {r.get('summary', '')}")
+        ask = wa.get_approval_request(subsystem, r)
+        if isinstance(ask, dict):
+            lines.append(f"      asks for your approval: {str(ask.get('note', ''))[:160]}")
     lines.append("")
     lines.append(f"Apply: /{subsystem} approve <id>   Reject: /{subsystem} reject <id>")
     if subsystem == wa.SKILLS:
@@ -82,7 +85,13 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
             applied += 1
             overwritten.extend(f"  {rec['id']}: {text}" for text in _replaced_entries(result))
         else:
-            failed.append(f"{rec['id']}: {msg}")
+            if result:
+                # The applier ran and rejected it: it can never apply as staged, so do not leave it lingering.
+                wa.discard_pending(subsystem, rec["id"])
+                failed.append(f"{rec['id']}: {msg} (dropped from pending; was: {(rec.get('summary') or '')[:100]})")
+            else:
+                # It could not run at all (store unavailable / exception): keep it so it can be retried.
+                failed.append(f"{rec['id']}: {msg} (kept pending, retry later)")
 
     out = [f"Approved {applied} {subsystem} write(s)."]
     if overwritten:

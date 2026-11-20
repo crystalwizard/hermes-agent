@@ -142,6 +142,21 @@ def _resolved_or_raw(filepath: str, task_id: str) -> str:
         return filepath
 
 
+def _is_hermes_config_path(config: str, candidates) -> bool:
+    """True when any candidate names the Hermes config file. Exact match everywhere; on Windows also case-insensitive,
+    ignoring trailing dots/spaces on each segment and an NTFS ``:stream`` suffix (all spellings of the same file)."""
+    def norm(p: str) -> str:
+        p = os.path.normpath(p)
+        if os.name == "nt":
+            drive, rest = os.path.splitdrive(p)
+            rest = rest.split(":", 1)[0]
+            rest = os.sep.join(seg if seg in ("", ".", "..") else seg.rstrip(" .") for seg in rest.split(os.sep))
+            p = drive + rest
+        return os.path.normcase(p)
+    target = norm(config)
+    return any(norm(c) == target for c in candidates)
+
+
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     # NT/device-namespace guard on the RAW string, BEFORE the task-base join:
@@ -160,11 +175,13 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     # approvals.mode and other security settings live in config.yaml; a
     # prompt-injected agent could silently disable exec approval by editing it.
     hermes_config = _get_hermes_config_resolved()
-    if hermes_config and hermes_config in candidates:
-        return (
-            f"Refusing to write to Hermes config file: {filepath}\n"
-            "Agent cannot modify security-sensitive configuration. "
-            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead.")
+    if hermes_config and _is_hermes_config_path(hermes_config, candidates):
+        # Kelly 2026-10-25: reads stay allowed; any write asks the human every time (one operation, never
+        # session/always, not skipped by auto-approve, blocked with no human present).
+        return _request_protected_instruction_approval(
+            [os.path.basename(hermes_config)], task_id, subject="Hermes config file",
+            why_always=("This file holds the approval mode and safety switches; approval is always "
+                        "required for each write (not bypassed by auto-approve)."))
     return None
 
 
@@ -251,7 +268,11 @@ _APPROVAL_UNAVAILABLE = "requires approval but the approval subsystem is unavail
 _NO_HUMAN = "requires approval but no interactive user or gateway is present to approve it."
 
 
-def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default") -> str | None:
+def _request_protected_instruction_approval(
+        reasons: list[str], task_id: str = "default", *,
+        subject: str = "protected agent-instruction file(s)",
+        why_always: str = ("These files steer future agent behavior; approval is always "
+                           "required (not bypassed by auto-approve).")) -> str | None:
     """Ask the human to approve a write to protected instruction file(s); ``None`` when approved.
 
     Deliberately NOT routed through ``_run_approval_gate`` (honors --yolo and
@@ -259,13 +280,10 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     scope, fail-closed without a human channel.
     """
     targets = ", ".join(dict.fromkeys(reasons))
-    description = (
-        f"Write to protected agent-instruction file(s): {targets}. "
-        "These files steer future agent behavior; approval is always "
-        "required (not bypassed by auto-approve).")
+    description = f"Write to {subject}: {targets}. {why_always}"
     display = f"<write to {targets}>"
     blocked = (
-        f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
+        f"BLOCKED: write to {subject} ({targets}) "
         "{why} The user has NOT consented to this write. Do NOT retry it or "
         "attempt the same edit via another path (terminal, execute_code, "
         "etc.).")

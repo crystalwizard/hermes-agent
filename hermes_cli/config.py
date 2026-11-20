@@ -469,6 +469,10 @@ def get_container_exec_info() -> Optional[dict]:
     exec into the container instead of running locally. None when container mode is off, when
     already inside the container, or when HERMES_DEV=1 is set. Only FileNotFoundError is
     swallowed; other errors (permissions, malformed data) propagate."""
+    # On Windows, NixOS container-mode must never execute an
+    # arbitrary backend named by a writable file on that platform.
+    if os.name == "nt":
+        return None
     if os.environ.get("HERMES_DEV") == "1":
         return None
 

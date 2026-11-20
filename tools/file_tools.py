@@ -556,7 +556,7 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
             pass
         baselines = task_data["full_write_baselines"]
         if stable and version is not None and count < 4:
-            task_data["dedup"][dedup_key] = version_before
+            task_data["dedup"][dedup_key] = version
             # A narrower view does not undo knowledge of these same bytes. Do
             # not revive a baseline after a partial read of a different version.
             complete = baselines.get(resolved_str) == version
@@ -672,7 +672,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         file_ops = _get_file_ops(task_id)
         version_before = _file_metadata(resolved_str) if _file_ops_uses_host_paths(file_ops) else None
         if (cached_version is not None and not is_background_review()
-                and version_before == cached_version and content_served_in_generation):
+                and (version_before is not None and version_before == cached_version[:-1]
+                 and _file_version(resolved_str) == cached_version) and content_served_in_generation):
             return _dedup_stub_or_block(task_data, dedup_key, path)
 
         result = file_ops.read_file(resolved_str if _file_ops_uses_host_paths(file_ops) else path, offset, limit)

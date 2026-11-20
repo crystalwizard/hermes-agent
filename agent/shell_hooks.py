@@ -159,7 +159,7 @@ def register_from_config(cfg: Optional[Dict[str, Any]], *, accept_hooks: bool = 
         with _registered_lock:
             if key in _registered:
                 continue
-            already_allowlisted = _is_allowlisted(spec.event, spec.command)
+            already_allowlisted = _allowlist_still_valid(spec.event, spec.command)
         if not already_allowlisted and not _prompt_and_record(spec.event, spec.command, accept_hooks=effective_accept):
             logger.warning("shell hook for %s (%s) not allowlisted — skipped. Use --accept-hooks / "
                            "HERMES_ACCEPT_HOOKS=1 / hooks_auto_accept: true, or approve at the TTY prompt next run.",
@@ -407,6 +407,8 @@ def _evaluate_result(spec: ShellHookSpec, r: Dict[str, Any]) -> Optional[Dict[st
     if r["returncode"] != 0:
         logger.warning("shell hook exited %d (event=%s command=%s); stderr=%s",
                        r["returncode"], spec.event, spec.command, stderr[:_STDERR_MESSAGE_LIMIT])
+        if fail_closed:
+            return _fail_closed_block(spec, f"hook exited with code {r['returncode']}")
     stdout = (r["stdout"] or "").strip()
     parsed = _parse_response(spec.event, stdout)
     if parsed is None and fail_closed and stdout and not _is_json_object(stdout):
@@ -520,6 +522,15 @@ def save_allowlist(data: Dict[str, Any]) -> None:
 
 def _is_allowlisted(event: str, command: str) -> bool:
     return allowlist_entry_for(event, command) is not None
+
+
+def _allowlist_still_valid(event: str, command: str) -> bool:
+    """Allowlisted AND the script has not been modified since approval (mtime recorded at approval must match now)."""
+    entry = allowlist_entry_for(event, command)
+    if entry is None:
+        return False
+    recorded = entry.get("script_mtime_at_approval")
+    return not recorded or recorded == script_mtime_iso(command)
 
 
 @contextmanager

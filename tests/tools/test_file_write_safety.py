@@ -831,4 +831,4 @@ class TestMultiplexProfileWriteGuardsAreProfileScoped:
         finally:
             reset_hermes_home_override(tok)
         assert err is not None
-        assert "Refusing to write to Hermes config file" in err
+        assert "write to Hermes config file" in err  # was: "Refusing to write..."; now routed to the always-ask gate (blocked without a human)

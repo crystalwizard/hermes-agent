@@ -1182,6 +1182,17 @@ def _tirith_scan(command: str) -> dict:
         }]}
 
 
+def _review_unmatched_enabled() -> bool:
+    """``approvals.review_unmatched`` (default True): in smart mode, review commands no pattern flagged."""
+    try:
+        value = approval_context._get_approval_config().get("review_unmatched", True)
+    except Exception:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() not in {"off", "false", "no", "0", "disabled"}
+    return value is not False
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False) -> dict:
@@ -1231,6 +1242,11 @@ def check_all_command_guards(command: str, env_type: str,
             warnings.append((tirith_key, _format_tirith_description(tirith_result), True))
     if is_dangerous and not is_approved(session_key, pattern_key):
         warnings.append((pattern_key, description, False))
+    if not warnings and approval_mode == "smart" and _review_unmatched_enabled():
+        # Patch 2026-10-25: a command no pattern flagged still gets the guardian review (the pattern list is a
+        # denylist, so unmatched is not the same as safe). Treated like a Tirith finding: session-max, never permanent.
+        warnings.append(("unreviewed-command",
+                         "No known-dangerous pattern matched; reviewing the command before it runs", True))
     if not warnings:
         return _approved()
 
